@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>The Pattern</title>
+
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0d0b09">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="The Pattern">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- The Wheel: seven spokes, seven Ages, bound by the Great Serpent. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="wheel" viewBox="0 0 100 100">
+    <circle cx="50" cy="50" r="47" class="w-ring-outer"/>
+    <circle cx="50" cy="50" r="41" class="w-ring-inner"/>
+    <g class="w-spokes">
+      <line x1="50"    y1="40"    x2="50"    y2="10"/>
+      <line x1="57.82" y1="43.77" x2="81.27" y2="25.06"/>
+      <line x1="59.75" y1="52.22" x2="88.99" y2="58.90"/>
+      <line x1="54.34" y1="59.01" x2="67.36" y2="86.04"/>
+      <line x1="45.66" y1="59.01" x2="32.64" y2="86.04"/>
+      <line x1="40.25" y1="52.22" x2="11.01" y2="58.90"/>
+      <line x1="42.18" y1="43.77" x2="18.73" y2="25.06"/>
+    </g>
+    <circle cx="50" cy="50" r="10" class="w-hub"/>
+  </symbol>
+</svg>
+
+<div id="app">
+
+  <!-- LIBRARY -->
+  <section id="view-library" class="view active">
+    <header class="topbar">
+      <div class="brand">
+        <h1>The Pattern</h1>
+        <p class="brand-sub">A Turning of the Wheel</p>
+      </div>
+      <button id="btn-add" class="wheel-btn" title="Weave a new thread" aria-label="Weave a new thread">
+        <svg class="wheel-ico"><use href="#wheel"/></svg>
+      </button>
+    </header>
+
+    <div id="storage-bar" class="storage-bar hidden">
+      <div class="storage-track"><div id="storage-fill" class="storage-fill"></div></div>
+      <span id="storage-label"></span>
+    </div>
+
+    <div id="library-empty" class="empty-state hidden">
+      <svg class="empty-wheel"><use href="#wheel"/></svg>
+      <p>The Pattern holds no threads yet.</p>
+      <p class="muted">Touch the Wheel above to bind a book into it. Everything you add is kept here on this device alone.</p>
+    </div>
+
+    <ul id="library-list" class="library-list"></ul>
+    <p class="tagline">The Wheel weaves as the Wheel wills.</p>
+  </section>
+
+  <!-- PLAYER -->
+  <section id="view-player" class="view">
+    <header class="topbar">
+      <button id="btn-back" class="icon-btn" aria-label="Back to the Pattern">&#8592;</button>
+      <h1 id="player-title">Title</h1>
+      <button id="btn-delete-book" class="icon-btn" aria-label="Unravel this thread">&#10005;</button>
+    </header>
+
+    <div class="player-body">
+      <div id="cover-art" class="cover-art">
+        <svg class="cover-wheel"><use href="#wheel"/></svg>
+        <span id="cover-initial">A</span>
+      </div>
+
+      <div class="chapter-name" id="chapter-name">Chapter 1</div>
+
+      <div class="scrub-row">
+        <span id="time-current" class="time-label">0:00</span>
+        <input id="scrub" type="range" min="0" max="1000" value="0" step="1">
+        <span id="time-remaining" class="time-label">-0:00</span>
+      </div>
+
+      <div class="transport-row">
+        <button id="btn-prev-chapter" class="transport-btn" aria-label="Previous chapter">&#9198;</button>
+        <button id="btn-back-15" class="transport-btn small" aria-label="Back 15 seconds">15&#8634;</button>
+        <button id="btn-playpause" class="transport-btn play" aria-label="Play or pause">&#9654;</button>
+        <button id="btn-fwd-30" class="transport-btn small" aria-label="Forward 30 seconds">30&#8635;</button>
+        <button id="btn-next-chapter" class="transport-btn" aria-label="Next chapter">&#9197;</button>
+      </div>
+
+      <div class="control-row">
+        <div class="field-box">
+          <label for="speed-select">Pace</label>
+          <select id="speed-select">
+            <option value="0.75">0.75x</option>
+            <option value="1" selected>1x</option>
+            <option value="1.25">1.25x</option>
+            <option value="1.5">1.5x</option>
+            <option value="1.75">1.75x</option>
+            <option value="2">2x</option>
+            <option value="2.5">2.5x</option>
+            <option value="3">3x</option>
+          </select>
+        </div>
+        <div class="field-box">
+          <label for="sleep-select">Tel'aran'rhiod</label>
+          <select id="sleep-select">
+            <option value="0">Waking</option>
+            <option value="5">5 min</option>
+            <option value="15">15 min</option>
+            <option value="30">30 min</option>
+            <option value="45">45 min</option>
+            <option value="60">60 min</option>
+            <option value="eoc">End of chapter</option>
+          </select>
+        </div>
+      </div>
+      <div id="sleep-status" class="sleep-status hidden"></div>
+
+      <h2 class="section-label">Chapters</h2>
+      <ul id="chapter-list" class="chapter-list"></ul>
+    </div>
+  </section>
+
+  <!-- ADD BOOK -->
+  <div id="modal-add" class="modal hidden">
+    <div class="modal-card">
+      <h2>Weave a New Thread</h2>
+      <p class="modal-hint">Choose one whole audiobook file, or every chapter file at once. Chapter marks inside a file are read automatically.</p>
+      <input id="file-input" type="file" multiple
+        accept="audio/*,video/*,.mp3,.mp2,.mpga,.m4a,.m4b,.m4r,.aac,.adts,.alac,.wav,.wave,.w64,.rf64,.aiff,.aif,.aifc,.caf,.au,.snd,.flac,.oga,.ogg,.ogx,.opus,.spx,.webm,.weba,.wma,.asf,.ape,.wv,.mpc,.tta,.tak,.shn,.ofr,.ra,.rm,.amr,.awb,.gsm,.voc,.ac3,.eac3,.dts,.mka,.mkv,.mp4,.m4v,.mov,.3gp,.3g2,.avi,.wmv,.dsf,.dff,.aa,.aax">
+      <div id="probe-status" class="probe-status hidden">Reading the threads...</div>
+      <div id="picked-files" class="picked-files"></div>
+      <div id="convert-notice" class="convert-notice hidden"></div>
+      <label class="field-label" for="book-title-input">Title</label>
+      <input id="book-title-input" type="text" placeholder="Name of the tale">
+      <label class="field-label" for="book-author-input">Teller (optional)</label>
+      <input id="book-author-input" type="text" placeholder="Who tells it">
+      <div id="import-progress" class="import-progress hidden">
+        <div class="storage-track"><div id="import-fill" class="storage-fill"></div></div>
+        <span id="import-label">Weaving...</span>
+      </div>
+      <div class="modal-actions">
+        <button id="btn-cancel-add" class="btn secondary">Cancel</button>
+        <button id="btn-confirm-add" class="btn primary" disabled>Bind</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<audio id="audio-el" preload="metadata"></audio>
+
+<script src="metadata.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

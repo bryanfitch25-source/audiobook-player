@@ -55,13 +55,15 @@ The script commits, pushes, enables Pages, and prints the URL. Re-run it any tim
 
 **Or Netlify Drop**, no account needed: drag `AudiobookPlayer-deploy.zip` onto https://app.netlify.com/drop.
 
-**Then, on your iPhone:**
+**Then, on your iPhone:** open that URL in Chrome and bookmark it, or add it to the home screen.
 
-1. Open the URL in Safari
-2. Tap Share, then "Add to Home Screen"
-3. Launch it from the home screen icon, not from Safari
+A note on browsers: the player works the same in Chrome as in Safari, because every iOS browser is required to use Apple's WebKit engine underneath. Audio format support, storage, and the converter all behave identically.
 
-Step 3 matters. Launching from the icon gives the app persistent storage that Safari will not clear after a period of inactivity.
+What differs is installation. Installing a web app to the home screen as a real standalone app is Safari-only on iOS; Chrome's shortcut opens back inside Chrome. That also means the library does not get the protected persistent storage an installed home-screen app receives, so iOS is more willing to clear it under heavy storage pressure or long disuse. Regular use keeps it alive, but keep your original files on the PC rather than treating the phone as the only copy.
+
+## Getting books onto the phone
+
+See [`transfer/README.md`](transfer/README.md). Two scripts: one merges a folder of chapter files into a single `.m4b` with chapter marks, the other beams files to the phone over Wi-Fi at local network speed with no cloud in the middle.
 
 ## Storage notes
 

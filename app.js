@@ -149,6 +149,7 @@ async function init() {
   await refreshStorageBar();
   wireEvents();
   registerServiceWorker();
+  showView('library');
 }
 
 function registerServiceWorker() {
@@ -217,6 +218,14 @@ function escapeHtml(str) {
 function showView(name) {
   viewLibrary.classList.toggle('active', name === 'library');
   viewPlayer.classList.toggle('active', name === 'player');
+  $('view-computer').classList.toggle('active', name === 'computer');
+
+  const tabbar = $('tabbar');
+  tabbar.classList.toggle('visible', name !== 'player');
+  $('tab-library').classList.toggle('active', name === 'library');
+  $('tab-computer').classList.toggle('active', name === 'computer');
+
+  if (name === 'computer' && window.ComputerTab) window.ComputerTab.onShow();
 }
 
 // ---------- add book flow ----------
@@ -851,6 +860,9 @@ function wireEvents() {
     refreshStorageBar();
   });
   $('btn-delete-book').addEventListener('click', deleteCurrentBook);
+
+  $('tab-library').addEventListener('click', () => { showView('library'); refreshLibrary(); refreshStorageBar(); });
+  $('tab-computer').addEventListener('click', () => showView('computer'));
 
   $('btn-playpause').addEventListener('click', togglePlayPause);
   $('btn-back-15').addEventListener('click', () => skipSeconds(-15));

@@ -1,10 +1,13 @@
 # The Pattern
 
-An offline audiobook player themed on the Wheel of Time novels. It runs in Safari on your iPhone and keeps every book on the device itself.
+An offline audiobook player themed on the Wheel of Time novels. It runs in Chrome on your iPhone and keeps every book on the device itself.
 
 ## How it works
 
-You import audio once through the Files app picker. The app copies it into IndexedDB, which is browser storage that lives on your phone. After that everything plays with no network connection and no server involved. Nothing is uploaded anywhere.
+There are two ways audio gets onto the phone, and both end with the same thing: a copy sitting in the app's own IndexedDB storage, playing with no network connection needed and nothing uploaded anywhere once it's there.
+
+- **Directly**, through the Files app picker on the phone.
+- **From the PC**, via the `server/` app running on your desktop. Drag files into its library page, it merges chapters and re-encodes only when actually needed, and stores the result on `D:\Audiobooks`. The phone's **My Computer** tab reaches that server over a Cloudflare tunnel (`books.banquetscaler.com`) and downloads whichever book you tap. See [`server/README.md`](server/README.md) for that half.
 
 ## Importing a whole audiobook
 
@@ -40,6 +43,7 @@ Converted audio is written as mono 64kbps AAC, transparent for narration and usu
 - Lock screen and Control Center controls via the Media Session API
 - Storage meter showing how much of the device quota the library uses
 - Each book is bound to one of the seven Ajahs, which sets its colour
+- **My Computer** tab: browse and download books straight from the PC library server, no cable or Wi-Fi transfer dance needed
 
 ## Getting it onto your iPhone
 
@@ -63,7 +67,9 @@ What differs is installation. Installing a web app to the home screen as a real 
 
 ## Getting books onto the phone
 
-See [`transfer/README.md`](transfer/README.md). Two scripts: one merges a folder of chapter files into a single `.m4b` with chapter marks, the other beams files to the phone over Wi-Fi at local network speed with no cloud in the middle.
+Open the **My Computer** tab in the app. First time, it asks for the PC server's address -- open the desktop library page (see [`server/README.md`](server/README.md)) and copy the link under "Connect your phone." After that, every book on the PC shows up there with a Download button.
+
+The PC server runs continuously in the background (a scheduled task, `AudiobookServer`) alongside the Cloudflare tunnel (`AudiobookTunnel`) that exposes it, so this works whenever the PC is on -- nothing to launch by hand.
 
 ## Storage notes
 
@@ -90,10 +96,12 @@ Service workers are allowed on localhost, so PWA behaviour can be tested there. 
 | `style.css` | Dark leather and gilt theme, sized for iPhone with safe area insets |
 | `app.js` | Storage, playback, chapter handling, sleep timer, Media Session |
 | `metadata.js` | Reads embedded chapter marks from MP4 and ID3 files |
+| `computer.js` | The My Computer tab: talks to the PC server, downloads books |
 | `sw.js` | Service worker caching the app shell for offline launch |
 | `manifest.json` | PWA metadata for the home screen install |
 | `icons/` | Wheel icons, including a maskable variant |
 | `vendor/ffmpeg/` | Bundled ffmpeg.wasm used to convert formats iOS cannot play |
+| `server/` | The PC-side library server -- not published, see its own README |
 
 ### A note on `vendor/ffmpeg`
 

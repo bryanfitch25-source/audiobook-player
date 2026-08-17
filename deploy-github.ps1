@@ -36,8 +36,11 @@ if (-not (Test-Path (Join-Path $here '.git'))) {
 }
 
 # ACCOUNTS.txt holds your account details and must never be published.
-# GitHub Pages needs a public repo on a free plan, so this stays excluded.
-@('ACCOUNTS.txt', '*.zip', '.DS_Store', 'Thumbs.db') |
+# server/ is the PC-side library server: it never needs to be publicly hosted,
+# and server/data/secret.txt is the access token gating that server -- publishing
+# it would defeat the whole point of the token.
+# GitHub Pages needs a public repo on a free plan, so all of this stays excluded.
+@('ACCOUNTS.txt', 'server/', '*.zip', '.DS_Store', 'Thumbs.db') |
   Set-Content -Encoding utf8 (Join-Path $here '.gitignore')
 
 # Keep git quiet about line endings and treat the wasm as binary.
@@ -54,10 +57,12 @@ if (-not $haveName) {
   Write-Host "Set commit identity for this repo to $user (noreply email)." -ForegroundColor DarkGray
 }
 
-$tracked = git ls-files ACCOUNTS.txt 2>$null
-if ($tracked) {
-  git rm --cached ACCOUNTS.txt --quiet 2>&1 | Out-Null
-  Write-Host "Removed ACCOUNTS.txt from the repo." -ForegroundColor Yellow
+foreach ($sensitive in @('ACCOUNTS.txt', 'server')) {
+  $tracked = git ls-files $sensitive 2>$null
+  if ($tracked) {
+    git rm -r --cached $sensitive --quiet 2>&1 | Out-Null
+    Write-Host "Removed $sensitive from the repo." -ForegroundColor Yellow
+  }
 }
 
 git add -A 2>&1 | Out-Null
@@ -102,5 +107,6 @@ Write-Host ""
 Write-Host "Done. Live in a minute or two at:" -ForegroundColor Green
 Write-Host "    https://$user.github.io/$RepoName/" -ForegroundColor White
 Write-Host ""
-Write-Host "On your iPhone: open that URL in Safari, tap Share, then Add to Home Screen." -ForegroundColor Cyan
-Write-Host "Launch it from the home screen icon so iOS keeps your library." -ForegroundColor Cyan
+Write-Host "Open that URL in Chrome on your iPhone and bookmark it." -ForegroundColor Cyan
+Write-Host "To load books: open the desktop library page, copy the connect link, and paste it" -ForegroundColor Cyan
+Write-Host "into the app's My Computer tab. See server\README.md to (re)start the PC server." -ForegroundColor Cyan

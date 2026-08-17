@@ -63,6 +63,49 @@
     <p class="tagline">The Wheel weaves as the Wheel wills.</p>
   </section>
 
+  <!-- MY COMPUTER -->
+  <section id="view-computer" class="view">
+    <header class="topbar">
+      <div class="brand">
+        <h1>My Computer</h1>
+        <p class="brand-sub">A Bridge Across the World</p>
+      </div>
+      <button id="btn-computer-settings" class="icon-btn" aria-label="Change server address">&#9881;</button>
+    </header>
+
+    <div id="computer-connect" class="connect-panel hidden">
+      <p>Paste the address shown on your PC's library page.</p>
+      <p class="muted">Open the desktop page, copy the link under "Connect your phone," and paste it here once.</p>
+      <input id="computer-url-input" type="text" placeholder="https://your-address/token/" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <div class="modal-actions">
+        <button id="btn-computer-cancel" class="btn secondary hidden">Cancel</button>
+        <button id="btn-computer-save" class="btn primary">Connect</button>
+      </div>
+      <p id="computer-connect-error" class="connect-error hidden"></p>
+    </div>
+
+    <div id="computer-content" class="hidden">
+      <div id="computer-status" class="probe-status hidden"></div>
+      <div id="computer-empty" class="empty-state hidden">
+        <p>No books on the PC library yet.</p>
+        <p class="muted">Drag files into the desktop page to add some.</p>
+      </div>
+      <ul id="computer-list" class="library-list"></ul>
+    </div>
+  </section>
+
+  <!-- TAB BAR -->
+  <nav id="tabbar" class="tabbar">
+    <button id="tab-library" class="tab-btn active" aria-label="Library">
+      <svg class="tab-ico"><use href="#wheel"/></svg>
+      <span>Library</span>
+    </button>
+    <button id="tab-computer" class="tab-btn" aria-label="My Computer">
+      <span class="tab-ico tab-ico-text">&#128421;</span>
+      <span>My Computer</span>
+    </button>
+  </nav>
+
   <!-- PLAYER -->
   <section id="view-player" class="view">
     <header class="topbar">
@@ -158,5 +201,6 @@
 
 <script src="metadata.js"></script>
 <script src="app.js"></script>
+<script src="computer.js"></script>
 </body>
 </html>

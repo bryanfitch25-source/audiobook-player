@@ -3,7 +3,7 @@
 // Bumped in lockstep with sw.js's CACHE constant. Shown in the UI so there is
 // never any ambiguity, after a service-worker update, about whether the code
 // actually running is the code that was just shipped.
-const APP_VERSION = 'the-pattern-v24'; // must exactly match CACHE in sw.js
+const APP_VERSION = 'the-pattern-v26'; // must exactly match CACHE in sw.js
 
 const DB_NAME = 'audiobook-player';
 const DB_VERSION = 2;
@@ -117,6 +117,102 @@ function idbPutBatch(storeName, values) {
  * apparently does. */
 const BLOB_CHUNK_BYTES = 4 * 1024 * 1024;
 const CHUNKS_PER_TRANSACTION = 8; // 32MB/transaction at the chunk size above
+
+/* Streamed books have no on-device copy at all, so a brief signal drop --
+ * walking into a building, an elevator, the tunnel hiccuping -- would
+ * otherwise stall playback the instant the network request for the next
+ * range fails. To ride that out, the app keeps prefetching ahead of the
+ * playback position into the Cache Storage API (disk-backed, built for
+ * exactly this kind of large binary response, unlike IndexedDB) while
+ * online, and the service worker serves from that cache when the network
+ * request for the live stream fails. Byte ranges rather than time ranges,
+ * since that's what the server actually understands; the current byte
+ * position is only an estimate from the book's overall average bitrate,
+ * which is fine for deciding how far ahead to prefetch. */
+const STREAM_BUFFER_CHUNK_BYTES = 1 * 1024 * 1024; // 1MB per prefetched piece
+const STREAM_BUFFER_AHEAD_SECONDS = 30 * 60; // keep ~30 minutes ready ahead of playback
+const STREAM_BUFFER_EVICT_MARGIN_BYTES = STREAM_BUFFER_CHUNK_BYTES * 2; // small cushion behind playback before dropping old chunks
+const STREAM_BUFFER_MIN_INTERVAL_MS = 15000;
+let streamBufferRunning = false;
+let streamBufferLastRun = 0;
+
+function streamBufferCacheName(streamUrl) {
+  return 'stream-buf:' + streamUrl;
+}
+
+async function maintainStreamBuffer(force) {
+  if (!currentBook || !currentBook.streamUrl) return;
+  if (!('caches' in window)) return;
+  const now = Date.now();
+  if (!force && (streamBufferRunning || now - streamBufferLastRun < STREAM_BUFFER_MIN_INTERVAL_MS)) return;
+  const duration = isFinite(audioEl.duration) && audioEl.duration > 0 ? audioEl.duration : null;
+  const sizeBytes = currentBook.sizeBytes || 0;
+  if (!duration || !sizeBytes) return;
+
+  streamBufferRunning = true;
+  streamBufferLastRun = now;
+  const streamUrl = currentBook.streamUrl;
+  try {
+    const bytesPerSecond = sizeBytes / duration;
+    const currentByte = Math.max(0, Math.floor(audioEl.currentTime * bytesPerSecond));
+    const targetByte = Math.min(sizeBytes, currentByte + Math.round(STREAM_BUFFER_AHEAD_SECONDS * bytesPerSecond));
+    const startChunk = Math.floor(currentByte / STREAM_BUFFER_CHUNK_BYTES);
+    const endChunk = Math.max(startChunk, Math.floor(Math.max(currentByte, targetByte - 1) / STREAM_BUFFER_CHUNK_BYTES));
+
+    const cache = await caches.open(streamBufferCacheName(streamUrl));
+
+    for (let i = startChunk; i <= endChunk; i++) {
+      const chunkStart = i * STREAM_BUFFER_CHUNK_BYTES;
+      if (chunkStart >= sizeBytes) break;
+      const chunkEnd = Math.min(sizeBytes, chunkStart + STREAM_BUFFER_CHUNK_BYTES) - 1;
+      const key = streamUrl + '?__buf=' + i;
+      if (await cache.match(key)) continue;
+      let res;
+      try {
+        res = await fetch(streamUrl, { headers: { Range: `bytes=${chunkStart}-${chunkEnd}` } });
+      } catch (e) {
+        break; // offline or unreachable -- stop this pass, the next tick will retry
+      }
+      if (res.status === 206 || res.ok) {
+        // Cache.put() flatly refuses to store a 206 response (a hard
+        // Cache Storage spec restriction, not a bug) -- re-wrap the same
+        // bytes as a plain 200 so it can be stored, keeping the real
+        // Content-Range header intact since that's what both this function's
+        // own eviction pass and the service worker's reconstruction read to
+        // know which bytes a stored chunk actually covers.
+        const blob = await res.blob();
+        const contentRange = res.headers.get('Content-Range') || `bytes ${chunkStart}-${chunkEnd}/${sizeBytes}`;
+        const contentType = res.headers.get('Content-Type') || 'application/octet-stream';
+        const storable = new Response(blob, {
+          status: 200,
+          headers: { 'Content-Type': contentType, 'Content-Range': contentRange, 'Content-Length': String(blob.size) },
+        });
+        await cache.put(key, storable);
+      } else break;
+    }
+
+    // Drop chunks well behind the playback position so a long book doesn't
+    // keep accumulating everything already listened to.
+    const evictBefore = currentByte - STREAM_BUFFER_EVICT_MARGIN_BYTES;
+    if (evictBefore > 0) {
+      for (const req of await cache.keys()) {
+        const m = /[?&]__buf=(\d+)/.exec(req.url);
+        if (!m) continue;
+        const idx = Number(m[1]);
+        const end = Math.min(sizeBytes, (idx + 1) * STREAM_BUFFER_CHUNK_BYTES) - 1;
+        if (end < evictBefore) await cache.delete(req);
+      }
+    }
+  } catch (e) {
+    // Best-effort resilience feature -- a failure here must never disrupt playback.
+  } finally {
+    streamBufferRunning = false;
+  }
+}
+
+async function clearStreamBuffer(streamUrl) {
+  try { await caches.delete(streamBufferCacheName(streamUrl)); } catch (e) {}
+}
 
 async function idbPutBlobChunked(blobId, source, type, onChunk) {
   const total = source.size;
@@ -966,6 +1062,7 @@ async function loadChapter(index, offset, autoplay) {
     audioEl.currentTime = Math.min(abs, audioEl.duration || abs);
     if (autoplay) audioEl.play().catch(() => {});
     updatePlayPauseIcon();
+    if (currentBook.streamUrl) maintainStreamBuffer(true);
   };
   audioEl.addEventListener('loadedmetadata', onReady);
 }
@@ -1055,7 +1152,9 @@ async function deleteCurrentBook() {
     ? `Remove "${currentBook.title}" from your library? It stays on the PC either way -- this just forgets it here.`
     : `Unravel "${currentBook.title}"? This removes it and all its audio from this device.`;
   if (!confirm(msg)) return;
-  if (!currentBook.streamUrl) {
+  if (currentBook.streamUrl) {
+    await clearStreamBuffer(currentBook.streamUrl);
+  } else {
     const blobIds = Array.from(new Set(currentBook.chapters.map((c) => c.blobId))).filter(Boolean);
     for (const id of blobIds) {
       await idbDeleteBlobChunked(id);
@@ -1197,8 +1296,8 @@ function wireEvents() {
     scrubbing = false;
   });
 
-  audioEl.addEventListener('timeupdate', () => { checkChapterBoundary(); updateScrub(); });
-  audioEl.addEventListener('play', () => { updatePlayPauseIcon(); if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing'; });
+  audioEl.addEventListener('timeupdate', () => { checkChapterBoundary(); updateScrub(); maintainStreamBuffer(false); });
+  audioEl.addEventListener('play', () => { updatePlayPauseIcon(); if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing'; maintainStreamBuffer(false); });
   audioEl.addEventListener('pause', () => { updatePlayPauseIcon(); saveProgress(); if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused'; });
   audioEl.addEventListener('ended', () => {
     if (sleepTimer.mode === 'eoc') {

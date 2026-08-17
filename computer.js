@@ -239,6 +239,7 @@ const ComputerTab = (() => {
       author: book.author || '',
       seriesNumber: book.seriesNumber || null,
       streamUrl,
+      sizeBytes: book.sizeBytes || 0,
       chapters: (book.chapters && book.chapters.length)
         ? book.chapters.map((c) => ({ name: c.name, start: c.start, duration: c.duration }))
         : [{ name: book.title, start: 0, duration: book.duration || 0 }],

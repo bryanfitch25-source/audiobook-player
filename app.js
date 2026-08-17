@@ -1,7 +1,12 @@
 /* Local-storage audiobook player. All audio data lives in IndexedDB on this device. */
 
+// Bumped in lockstep with sw.js's CACHE constant. Shown in the UI so there is
+// never any ambiguity, after a service-worker update, about whether the code
+// actually running is the code that was just shipped.
+const APP_VERSION = 'the-pattern-v23'; // must exactly match CACHE in sw.js
+
 const DB_NAME = 'audiobook-player';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 let db;
 
 function openDb() {
@@ -14,6 +19,9 @@ function openDb() {
       }
       if (!_db.objectStoreNames.contains('chapterBlobs')) {
         _db.createObjectStore('chapterBlobs', { keyPath: 'id' });
+      }
+      if (!_db.objectStoreNames.contains('diagLog')) {
+        _db.createObjectStore('diagLog', { keyPath: 'id', autoIncrement: true });
       }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
@@ -40,18 +48,169 @@ function idbGet(storeName, key) {
 function idbPut(storeName, value) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(storeName, 'readwrite');
-    tx.objectStore(storeName).put(value);
+    const req = tx.objectStore(storeName).put(value);
     tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
+    // A transaction can abort with tx.error === null under memory/storage
+    // pressure on at least one real device -- this was previously only
+    // listening for onerror, so that case surfaced as a bare `null` with
+    // zero diagnostic value. Listening for onabort too, and building a real
+    // message from whatever's actually available (the request's own error,
+    // the transaction's, or a fallback naming what almost certainly caused
+    // it) turns that into something a diagnostic log can actually show.
+    const fail = () => {
+      const detail = (req.error && req.error.message) || (tx.error && tx.error.message)
+        || 'transaction aborted with no error detail (commonly storage/memory pressure)';
+      reject(new Error(detail));
+    };
+    tx.onerror = fail;
+    tx.onabort = fail;
   });
 }
 function idbDelete(storeName, key) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(storeName, 'readwrite');
-    tx.objectStore(storeName).delete(key);
+    const req = tx.objectStore(storeName).delete(key);
     tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
+    const fail = () => {
+      const detail = (req.error && req.error.message) || (tx.error && tx.error.message)
+        || 'transaction aborted with no error detail';
+      reject(new Error(detail));
+    };
+    tx.onerror = fail;
+    tx.onabort = fail;
   });
+}
+
+/* Writes several values in one transaction rather than one each. On real
+ * device data, per-chunk write time roughly tripled between the first five
+ * 4MB chunks and the next five (3.3s -> 8.6s each) within a *single* import
+ * on freshly-cleared storage -- not a fixed "this device is slow" cost, but
+ * one that compounds as writing continues. That shape points at per-
+ * transaction overhead (each one committing/syncing independently) rather
+ * than per-byte cost, which batching several chunks into one transaction
+ * directly reduces: 1/8th as many commits for the same data. */
+function idbPutBatch(storeName, values) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    const store = tx.objectStore(storeName);
+    for (const v of values) store.put(v);
+    tx.oncomplete = () => resolve();
+    const fail = () => {
+      const detail = (tx.error && tx.error.message) || 'transaction aborted with no error detail';
+      reject(new Error(detail));
+    };
+    tx.onerror = fail;
+    tx.onabort = fail;
+  });
+}
+
+/* Audiobooks run up to a couple of GB. Writing one that large into IndexedDB
+ * as a single value crashes this app on at least one real device -- true
+ * whether the source is a freshly-downloaded Blob or a plain File handed
+ * straight from the OS file picker, so the failure is IndexedDB's structured
+ * clone of one huge value, not anything about how the data was obtained.
+ * The fix is to never ask it to do that: every chapterBlobs entry is written
+ * as many chunks, several per transaction, instead of one value in one.
+ * Reassembling them with new Blob([...chunks]) at playback time is cheap --
+ * Blobs are handles, not copies, so combining several doesn't re-materialize
+ * the audio in JS memory the way writing one giant value to IndexedDB
+ * apparently does. */
+const BLOB_CHUNK_BYTES = 4 * 1024 * 1024;
+const CHUNKS_PER_TRANSACTION = 8; // 32MB/transaction at the chunk size above
+
+async function idbPutBlobChunked(blobId, source, type, onChunk) {
+  const total = source.size;
+  const chunkCount = Math.max(1, Math.ceil(total / BLOB_CHUNK_BYTES));
+  try {
+    for (let batchStart = 0; batchStart < chunkCount; batchStart += CHUNKS_PER_TRANSACTION) {
+      const batchEnd = Math.min(batchStart + CHUNKS_PER_TRANSACTION, chunkCount);
+      const batch = [];
+      for (let i = batchStart; i < batchEnd; i++) {
+        const start = i * BLOB_CHUNK_BYTES;
+        const chunk = source.slice(start, Math.min(start + BLOB_CHUNK_BYTES, total));
+        batch.push({ id: `${blobId}#${i}`, blob: chunk });
+      }
+      await idbPutBatch('chapterBlobs', batch);
+      if (onChunk) onChunk(batchEnd, chunkCount);
+    }
+    await idbPut('chapterBlobs', { id: blobId, type, chunkCount, size: total, isChunked: true });
+  } catch (e) {
+    // Deliberately not attempting cleanup here. Opening fresh IndexedDB
+    // transactions immediately after one just failed hit a real
+    // WebKit-specific error on a real device ("delete range without an
+    // in-progress transaction") -- and worse, that cleanup failure replaced
+    // the actual error in what the user saw, hiding the one piece of
+    // information most worth having right after a crash. Whatever chunks
+    // this attempt wrote stay behind as orphans; cleanupOrphanedBlobChunks()
+    // sweeps them on the next app launch instead, in a clean context with no
+    // just-failed transaction to race against.
+    throw e;
+  }
+}
+
+async function idbGetReconstitutedBlob(blobId) {
+  const meta = await idbGet('chapterBlobs', blobId);
+  if (!meta) return null;
+
+  // Books imported before chunked storage existed still have the whole blob
+  // under the plain blobId key -- read those the old way rather than forcing
+  // a re-import.
+  if (!meta.isChunked) return { blob: meta.blob, type: meta.type || (meta.blob && meta.blob.type) };
+
+  const parts = [];
+  for (let i = 0; i < meta.chunkCount; i++) {
+    const rec = await idbGet('chapterBlobs', `${blobId}#${i}`);
+    if (!rec) return null; // a chunk went missing -- treat as unreadable rather than play a truncated file
+    parts.push(rec.blob);
+  }
+  return { blob: new Blob(parts, { type: meta.type }), type: meta.type };
+}
+
+/* Shared diagnostic log, written from both import paths (local file picker
+ * and My Computer download) so a crash in either one is equally visible.
+ * IndexedDB, not localStorage: a hard OS-level process kill can lose a
+ * localStorage write even after it appeared to succeed, since the browser
+ * doesn't always flush it to disk synchronously, but an IndexedDB
+ * transaction's completion callback is a real durability guarantee. */
+const DIAG_LOG_STORE = 'diagLog';
+const DIAG_LOG_CAP = 500;
+
+async function checkpoint(label) {
+  try { await idbPut(DIAG_LOG_STORE, { label, at: Date.now() }); } catch (e) {}
+}
+async function readDiagLog() {
+  try {
+    const all = await idbGetAll(DIAG_LOG_STORE);
+    all.sort((a, b) => a.id - b.id);
+    return all;
+  } catch (e) { return []; }
+}
+async function trimDiagLog() {
+  try {
+    const all = await readDiagLog();
+    const excess = all.length - DIAG_LOG_CAP;
+    if (excess <= 0) return;
+    for (const entry of all.slice(0, excess)) await idbDelete(DIAG_LOG_STORE, entry.id);
+  } catch (e) {}
+}
+async function clearDiagLogMarker() {
+  await checkpoint('--- completed successfully ---');
+  trimDiagLog(); // housekeeping, not on the critical path
+}
+async function lastCrashedCheckpoint() {
+  const log = await readDiagLog();
+  if (!log.length) return null;
+  const last = log[log.length - 1];
+  if (last.label === '--- completed successfully ---') return null;
+  return last;
+}
+
+async function idbDeleteBlobChunked(blobId) {
+  const meta = await idbGet('chapterBlobs', blobId);
+  if (meta && meta.isChunked) {
+    for (let i = 0; i < meta.chunkCount; i++) await idbDelete('chapterBlobs', `${blobId}#${i}`);
+  }
+  await idbDelete('chapterBlobs', blobId);
 }
 
 function uid() {
@@ -150,14 +309,74 @@ async function init() {
   wireEvents();
   registerServiceWorker();
   showView('library');
+  cleanupOrphanedBlobChunks(); // fire-and-forget housekeeping, not on the critical path
+}
+
+/* Before idbPutBlobChunked cleaned up after itself on failure, a crashed or
+ * errored import left every chunk it had managed to write behind, under a
+ * blobId no book would ever reference again -- pure waste, and on a device
+ * already struggling with storage, exactly the kind of thing worth not
+ * leaving lying around. Sweeps for chunk records whose blobId isn't
+ * referenced by any book and removes them. */
+async function cleanupOrphanedBlobChunks() {
+  try {
+    const [allBooks, allBlobRecords] = await Promise.all([idbGetAll('books'), idbGetAll('chapterBlobs')]);
+    const inUse = new Set();
+    for (const b of allBooks) for (const c of (b.chapters || [])) if (c.blobId) inUse.add(c.blobId);
+
+    let removed = 0;
+    for (const rec of allBlobRecords) {
+      const base = String(rec.id).split('#')[0];
+      if (inUse.has(base)) continue;
+      await idbDelete('chapterBlobs', rec.id);
+      removed++;
+    }
+    if (removed) console.log(`Cleaned up ${removed} orphaned blob chunk(s) from failed imports.`);
+  } catch (e) {}
 }
 
 function registerServiceWorker() {
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
+    checkVersionMatch();
+    navigator.serviceWorker.addEventListener('controllerchange', checkVersionMatch);
+  } else {
+    showVersion(APP_VERSION, null);
   }
   if (navigator.storage && navigator.storage.persist) {
     navigator.storage.persist().catch(() => {});
+  }
+}
+
+function showVersion(pageVersion, swVersion) {
+  const el = $('app-version');
+  if (!el) return;
+  const short = (v) => (v || '').replace(/^the-pattern-/, '');
+  if (swVersion && swVersion !== pageVersion) {
+    // The page's own JS and the service worker disagree about what's
+    // current -- exactly the "did the update actually take" ambiguity that
+    // "close and reopen" alone could never resolve. Surface it plainly
+    // instead of leaving it invisible.
+    el.textContent = `${short(pageVersion)} (worker still serving ${short(swVersion)} -- close and reopen the app fully)`;
+  } else {
+    el.textContent = short(pageVersion);
+  }
+}
+
+async function checkVersionMatch() {
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const controller = navigator.serviceWorker.controller;
+    if (!controller) { showVersion(APP_VERSION, null); return; }
+    const swVersion = await new Promise((resolve) => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = (e) => resolve(e.data && e.data.swVersion);
+      controller.postMessage('get-version', [channel.port2]);
+      setTimeout(() => resolve(null), 2000);
+    });
+    showVersion(APP_VERSION, swVersion);
+  } catch (e) {
+    showVersion(APP_VERSION, null);
   }
 }
 
@@ -182,9 +401,10 @@ function renderBookRow(book) {
   const pct = totalDur > 0 ? Math.min(100, (elapsed / totalDur) * 100) : 0;
   const remaining = Math.max(0, totalDur - elapsed);
   const nCh = book.chapters.length;
+  const badge = book.seriesNumber ? `<div class="series-badge">${escapeHtml(String(book.seriesNumber))}</div>` : '';
 
   li.innerHTML = `
-    <div class="book-cover" style="background:linear-gradient(150deg, ${ajah.color}, rgba(0,0,0,0.75))">${escapeHtml((book.title || '?')[0].toUpperCase())}</div>
+    <div class="book-cover" style="background:linear-gradient(150deg, ${ajah.color}, rgba(0,0,0,0.75))">${badge}${escapeHtml((book.title || '?')[0].toUpperCase())}</div>
     <div class="book-meta">
       <div class="book-title">${escapeHtml(book.title)}</div>
       <div class="book-author">${escapeHtml(book.author || `${nCh} chapter${nCh === 1 ? '' : 's'}`)}</div>
@@ -349,7 +569,30 @@ function guessTitle(files) {
  * for plenty of things Safari then refuses to decode, so we probe for real.
  * Anything that fails the probe gets transcoded to AAC once, at import time. */
 
+// Containers/codecs universally supported on iOS -- for these there is no
+// real question of "will this play," so a large one is trusted outright
+// rather than probed.
+const TRUSTED_EXTS = new Set(['m4a', 'm4b', 'mp3', 'mp2', 'aac', 'wav', 'aiff', 'aif', 'caf', 'flac']);
+// Handing a very large file to an <audio> element just to check whether it
+// plays turned out to be unsafe on at least one real device -- not merely
+// slow (a generous timeout would fix that) but capable of failing outright
+// or crashing the tab on nothing more than a 700MB blob URL. A false
+// negative here is far more costly than skipping the check: it routes into
+// on-device conversion, which needs a real ffmpeg WebAssembly instance and
+// has crashed outright even on a modest input. So above this size, a
+// trusted container is never handed to the probe at all -- duration is
+// simply unknown until first real playback, which is a normal, minor
+// wrinkle (see the self-healing in loadChapter), not a crash.
+const SKIP_PROBE_ABOVE_BYTES = 60 * 1024 * 1024;
+
 function probeFile(file) {
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  const trusted = TRUSTED_EXTS.has(ext);
+
+  if (trusted && file.size > SKIP_PROBE_ABOVE_BYTES) {
+    return Promise.resolve({ playable: true, duration: 0 });
+  }
+
   return new Promise((resolve) => {
     const url = URL.createObjectURL(file);
     const a = document.createElement('audio');
@@ -363,7 +606,9 @@ function probeFile(file) {
       URL.revokeObjectURL(url);
       resolve({ playable, duration: playable ? duration : 0 });
     };
-    const timer = setTimeout(() => finish(false, 0), 15000);
+    // Below the size threshold, a timeout is a genuine ambiguous case, not
+    // an automatic pass -- trust the container, don't just guess playable.
+    const timer = setTimeout(() => finish(trusted, 0), 45000);
     a.onloadedmetadata = () => finish(isFinite(a.duration) && a.duration > 0, a.duration);
     a.onerror = () => finish(false, 0);
     a.src = url;
@@ -493,6 +738,17 @@ async function confirmAddBook() {
   btnConfirmAdd.disabled = true;
   importProgress.classList.remove('hidden');
 
+  try {
+    await confirmAddBookInner(title, author);
+  } catch (e) {
+    await checkpoint('caught error during local import: ' + (e && e.message ? e.message : String(e)));
+    importProgress.classList.add('hidden');
+    btnConfirmAdd.disabled = false;
+    alert('Import failed: ' + (e && e.message ? e.message : String(e)));
+  }
+}
+
+async function confirmAddBookInner(title, author) {
   const bookId = uid();
   const chapters = [];
   const failures = [];
@@ -506,6 +762,7 @@ async function confirmAddBook() {
 
     if (st.state === 'drm') { failures.push(`${file.name}: DRM-protected`); continue; }
 
+    await checkpoint(`local import: starting file ${i + 1}/${total}: "${file.name}" (${fmtBytes(file.size)}, state=${st.state})`);
     importLabel.textContent = `${i + 1} of ${total}: ${file.name}`;
     importFill.style.width = Math.round(base * 100) + '%';
 
@@ -534,8 +791,12 @@ async function confirmAddBook() {
       }
     }
 
+    await checkpoint(`local import: writing "${file.name}" (${fmtBytes(blob.size)}) in chunks`);
     const blobId = uid();
-    await idbPut('chapterBlobs', { id: blobId, blob, type: blob.type || 'audio/mpeg' });
+    await idbPutBlobChunked(blobId, blob, blob.type || 'audio/mpeg', (done, count) => {
+      checkpoint(`local import: wrote chunk ${done}/${count} of "${file.name}" (${fmtBytes(done * BLOB_CHUNK_BYTES)})`);
+    });
+    await checkpoint(`local import: finished writing "${file.name}"`);
 
     // Embedded marks turn one file into many chapters that share a single blob.
     const marks = st.marks || [];
@@ -579,6 +840,7 @@ async function confirmAddBook() {
     lastPlayed: Date.now(),
   };
   await idbPut('books', book);
+  clearDiagLogMarker();
 
   importProgress.classList.add('hidden');
   closeAddModal();
@@ -598,6 +860,14 @@ async function openPlayer(bookId) {
   const ajah = ajahFor(book.title || book.id);
   $('cover-art').style.background = `linear-gradient(150deg, ${ajah.color}, rgba(0,0,0,0.85))`;
   $('cover-initial').textContent = (book.title || '?')[0].toUpperCase();
+  const existingBadge = $('cover-art').querySelector('.series-badge');
+  if (existingBadge) existingBadge.remove();
+  if (book.seriesNumber) {
+    const badgeEl = document.createElement('div');
+    badgeEl.className = 'series-badge';
+    badgeEl.textContent = String(book.seriesNumber);
+    $('cover-art').appendChild(badgeEl);
+  }
   $('speed-select').value = String(book.speed || 1);
   renderChapterList();
   showView('player');
@@ -636,7 +906,11 @@ async function loadChapter(index, offset, autoplay) {
   if (!currentBook) return;
   if (index < 0 || index >= currentBook.chapters.length) return;
   const ch = currentBook.chapters[index];
-  const rel = Math.max(0, Math.min(offset || 0, ch.duration || 0));
+  // A duration of 0 means it's not known yet (see the probeFile timeout
+  // fallback) rather than an actually-empty chapter -- don't clamp the
+  // resume offset down to 0 in that case, or resume position is silently
+  // lost until the real duration is learned from an actual playback.
+  const rel = ch.duration > 0 ? Math.max(0, Math.min(offset || 0, ch.duration)) : Math.max(0, offset || 0);
   const abs = (ch.start || 0) + rel;
 
   currentBook.currentChapterIndex = index;
@@ -656,7 +930,7 @@ async function loadChapter(index, offset, autoplay) {
     return;
   }
 
-  const rec = await idbGet('chapterBlobs', ch.blobId);
+  const rec = await idbGetReconstitutedBlob(ch.blobId);
   if (!rec) return;
 
   if (currentBlobUrl) URL.revokeObjectURL(currentBlobUrl);
@@ -667,6 +941,14 @@ async function loadChapter(index, offset, autoplay) {
 
   const onReady = () => {
     audioEl.removeEventListener('loadedmetadata', onReady);
+    // Self-heal an unknown duration now that the real one is available --
+    // this is the only moment it can be learned for a file whose import-time
+    // probe timed out on a large file rather than getting a real answer.
+    if (!(ch.duration > 0) && isFinite(audioEl.duration) && audioEl.duration > 0) {
+      ch.duration = audioEl.duration;
+      idbPut('books', currentBook);
+      renderChapterList();
+    }
     audioEl.currentTime = Math.min(abs, audioEl.duration || abs);
     if (autoplay) audioEl.play().catch(() => {});
     updatePlayPauseIcon();
@@ -758,7 +1040,7 @@ async function deleteCurrentBook() {
   if (!confirm(`Unravel "${currentBook.title}"? This removes it and all its audio from this device.`)) return;
   const blobIds = Array.from(new Set(currentBook.chapters.map((c) => c.blobId)));
   for (const id of blobIds) {
-    await idbDelete('chapterBlobs', id);
+    await idbDeleteBlobChunked(id);
   }
   await idbDelete('books', currentBook.id);
   audioEl.pause();

@@ -61,6 +61,7 @@
 
     <ul id="library-list" class="library-list"></ul>
     <p class="tagline">The Wheel weaves as the Wheel wills.</p>
+    <p id="app-version" class="app-version"></p>
   </section>
 
   <!-- MY COMPUTER -->
@@ -85,6 +86,13 @@
     </div>
 
     <div id="computer-content" class="hidden">
+      <p id="computer-crash-report" class="crash-report hidden"></p>
+      <p class="dl-hint">Keep this screen open while a download runs. The screen is kept from auto-locking, but leaving the app or manually locking the phone will stop it, same as any web page.</p>
+      <div class="log-btn-row">
+        <button id="btn-computer-export-log" class="btn secondary export-log-btn">Show Diagnostic Log</button>
+        <button id="btn-computer-copy-log" class="btn secondary copy-log-btn hidden">Copy</button>
+      </div>
+      <pre id="computer-log-box" class="log-box hidden"></pre>
       <div id="computer-status" class="probe-status hidden"></div>
       <div id="computer-empty" class="empty-state hidden">
         <p>No books on the PC library yet.</p>
@@ -175,8 +183,7 @@
     <div class="modal-card">
       <h2>Weave a New Thread</h2>
       <p class="modal-hint">Choose one whole audiobook file, or every chapter file at once. Chapter marks inside a file are read automatically.</p>
-      <input id="file-input" type="file" multiple
-        accept="audio/*,video/*,.mp3,.mp2,.mpga,.m4a,.m4b,.m4r,.aac,.adts,.alac,.wav,.wave,.w64,.rf64,.aiff,.aif,.aifc,.caf,.au,.snd,.flac,.oga,.ogg,.ogx,.opus,.spx,.webm,.weba,.wma,.asf,.ape,.wv,.mpc,.tta,.tak,.shn,.ofr,.ra,.rm,.amr,.awb,.gsm,.voc,.ac3,.eac3,.dts,.mka,.mkv,.mp4,.m4v,.mov,.3gp,.3g2,.avi,.wmv,.dsf,.dff,.aa,.aax">
+      <input id="file-input" type="file" multiple>
       <div id="probe-status" class="probe-status hidden">Reading the threads...</div>
       <div id="picked-files" class="picked-files"></div>
       <div id="convert-notice" class="convert-notice hidden"></div>

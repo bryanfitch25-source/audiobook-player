@@ -3,7 +3,7 @@
 // Bumped in lockstep with sw.js's CACHE constant. Shown in the UI so there is
 // never any ambiguity, after a service-worker update, about whether the code
 // actually running is the code that was just shipped.
-const APP_VERSION = 'the-pattern-v23'; // must exactly match CACHE in sw.js
+const APP_VERSION = 'the-pattern-v24'; // must exactly match CACHE in sw.js
 
 const DB_NAME = 'audiobook-player';
 const DB_VERSION = 2;
@@ -402,11 +402,12 @@ function renderBookRow(book) {
   const remaining = Math.max(0, totalDur - elapsed);
   const nCh = book.chapters.length;
   const badge = book.seriesNumber ? `<div class="series-badge">${escapeHtml(String(book.seriesNumber))}</div>` : '';
+  const streamTag = book.streamUrl ? '<span class="stream-tag">Streaming</span>' : '';
 
   li.innerHTML = `
     <div class="book-cover" style="background:linear-gradient(150deg, ${ajah.color}, rgba(0,0,0,0.75))">${badge}${escapeHtml((book.title || '?')[0].toUpperCase())}</div>
     <div class="book-meta">
-      <div class="book-title">${escapeHtml(book.title)}</div>
+      <div class="book-title">${escapeHtml(book.title)}${streamTag}</div>
       <div class="book-author">${escapeHtml(book.author || `${nCh} chapter${nCh === 1 ? '' : 's'}`)}</div>
       <div class="book-progress-track"><div class="book-progress-fill" style="width:${pct}%"></div></div>
       <div class="book-sub">${pct >= 99.5 ? 'The Wheel turns' : fmtTime(remaining) + ' remaining'}</div>
@@ -922,21 +923,34 @@ async function loadChapter(index, offset, autoplay) {
   renderChapterList();
   updateMediaSessionMetadata();
 
+  // A streamed book has one network URL backing every chapter, in place of
+  // a blobId backing an on-device blob -- same "which source is currently
+  // loaded" check either way, just a different kind of key.
+  const srcKey = currentBook.streamUrl || ch.blobId;
+
   // Chapters inside the same file need only a seek, not a reload.
-  if (ch.blobId === loadedBlobId && audioEl.readyState > 0) {
+  if (srcKey === loadedBlobId && audioEl.readyState > 0) {
     audioEl.currentTime = abs;
     if (autoplay && audioEl.paused) audioEl.play().catch(() => {});
     updatePlayPauseIcon();
     return;
   }
 
-  const rec = await idbGetReconstitutedBlob(ch.blobId);
-  if (!rec) return;
+  if (currentBlobUrl) { URL.revokeObjectURL(currentBlobUrl); currentBlobUrl = null; }
 
-  if (currentBlobUrl) URL.revokeObjectURL(currentBlobUrl);
-  currentBlobUrl = URL.createObjectURL(rec.blob);
-  loadedBlobId = ch.blobId;
-  audioEl.src = currentBlobUrl;
+  if (currentBook.streamUrl) {
+    // Streamed books play straight off the PC server's URL -- the browser's
+    // own HTTP client handles Range requests for seeking natively, no local
+    // storage write involved at all.
+    loadedBlobId = srcKey;
+    audioEl.src = currentBook.streamUrl;
+  } else {
+    const rec = await idbGetReconstitutedBlob(ch.blobId);
+    if (!rec) return;
+    currentBlobUrl = URL.createObjectURL(rec.blob);
+    loadedBlobId = ch.blobId;
+    audioEl.src = currentBlobUrl;
+  }
   audioEl.playbackRate = currentBook.speed || 1;
 
   const onReady = () => {
@@ -1037,10 +1051,15 @@ function saveProgress() {
 
 async function deleteCurrentBook() {
   if (!currentBook) return;
-  if (!confirm(`Unravel "${currentBook.title}"? This removes it and all its audio from this device.`)) return;
-  const blobIds = Array.from(new Set(currentBook.chapters.map((c) => c.blobId)));
-  for (const id of blobIds) {
-    await idbDeleteBlobChunked(id);
+  const msg = currentBook.streamUrl
+    ? `Remove "${currentBook.title}" from your library? It stays on the PC either way -- this just forgets it here.`
+    : `Unravel "${currentBook.title}"? This removes it and all its audio from this device.`;
+  if (!confirm(msg)) return;
+  if (!currentBook.streamUrl) {
+    const blobIds = Array.from(new Set(currentBook.chapters.map((c) => c.blobId))).filter(Boolean);
+    for (const id of blobIds) {
+      await idbDeleteBlobChunked(id);
+    }
   }
   await idbDelete('books', currentBook.id);
   audioEl.pause();

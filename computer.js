@@ -1,9 +1,16 @@
 /* The "My Computer" tab: talks to the PC-side library server over the
- * Cloudflare tunnel, lists what's stored there, and downloads a book straight
- * into this device's own IndexedDB library using the same storage shape as a
- * manually-picked file. The server already ran everything through ffprobe
- * during import, so its title/author/chapters are trusted as-is rather than
- * re-parsed on the phone -- one correct source, not two that could disagree. */
+ * Cloudflare tunnel, lists what's stored there, and plays a book straight
+ * off the server -- no download, no on-device copy. A lightweight library
+ * record (title/author/chapters/streamUrl) is saved so resume position and
+ * progress persist the same way a fully local book's does, but the actual
+ * audio bytes are never written to this device; the <audio> element just
+ * points at the PC's URL and the browser's own HTTP client handles Range
+ * requests for seeking. This replaced an earlier download-into-IndexedDB
+ * design that reliably crashed on large (500MB+) real audiobooks -- writing
+ * a file that size into IndexedDB in chunks got slower per-chunk as the
+ * write went on and eventually took the tab down before finishing, a
+ * WebKit-side limitation no amount of chunk/batch tuning fully fixed.
+ * Streaming sidesteps the problem: no giant on-device write ever happens. */
 
 const ComputerTab = (() => {
   const STORAGE_KEY = 'pc-server-url';
@@ -87,7 +94,7 @@ const ComputerTab = (() => {
     if (!box) return;
     if (!crashed) { box.classList.add('hidden'); return; }
     const seconds = Math.round((Date.now() - crashed.at) / 1000);
-    box.textContent = `Last download stopped without finishing. Last known step: "${crashed.label}" (${seconds}s before this reopen). Tap "Save Diagnostic Report" below to save the full log as a file.`;
+    box.textContent = `Something went wrong last time. Last known step: "${crashed.label}" (${seconds}s before this reopen). Tap "Show Diagnostic Log" below to see the full log.`;
     box.classList.remove('hidden');
   }
 
@@ -193,168 +200,58 @@ const ComputerTab = (() => {
     `;
 
     const action = document.createElement('div');
-    if (local) {
-      action.className = 'dl-done';
-      action.textContent = 'In library';
-    } else {
-      const btn = document.createElement('button');
-      btn.className = 'btn-download';
-      btn.textContent = 'Download';
-      btn.addEventListener('click', () => downloadBook(book, btn, action));
-      action.appendChild(btn);
-    }
+    const btn = document.createElement('button');
+    btn.className = 'btn-download';
+    btn.textContent = 'Play';
+    btn.addEventListener('click', () => openRemoteBook(book, local, btn));
+    action.appendChild(btn);
     li.appendChild(action);
     return li;
   }
 
-  /* Keeps the screen from auto-locking for the duration of a download.
-   * Supported on iOS 16.4+ in both Safari and Chrome (same WebKit engine).
-   * This only stops the *automatic* timeout-based lock -- it cannot stop a
-   * manual press of the power button or the user switching apps. iOS
-   * suspends a page's JavaScript entirely the moment it's backgrounded or
-   * the screen is manually locked, and no web API can override that; a
-   * download in progress at that moment will not resume on its own. There's
-   * no way around this from inside a web app on iOS -- keeping the app open
-   * and the screen on manually is the only thing that reliably works. */
-  async function withWakeLock(fn) {
-    let lock = null;
-    const acquire = async () => {
-      try {
-        if ('wakeLock' in navigator) lock = await navigator.wakeLock.request('screen');
-      } catch (e) { /* denied or unsupported -- proceed without it */ }
-    };
-    const onVisible = () => { if (document.visibilityState === 'visible' && !lock) acquire(); };
-    await acquire();
-    document.addEventListener('visibilitychange', onVisible);
-    try {
-      return await fn();
-    } finally {
-      document.removeEventListener('visibilitychange', onVisible);
-      if (lock) lock.release().catch(() => {});
-    }
-  }
-
-  async function downloadBook(book, btn, actionContainer) {
+  /* Tapping a PC book either opens it straight away (if it's already in the
+   * library from a previous tap) or first writes the small metadata record
+   * that lets it appear there, then opens it. Either way nothing but text
+   * (title/author/chapter list/URL) ever touches this device's storage. */
+  async function openRemoteBook(book, local, btn) {
     if (inFlight.has(book.id)) return;
     inFlight.add(book.id);
     btn.disabled = true;
-
-    const progressEl = document.createElement('span');
-    progressEl.className = 'dl-progress';
-    progressEl.textContent = '0%';
-    actionContainer.appendChild(progressEl);
-
     try {
-      await withWakeLock(() => downloadBookInner(book, progressEl));
+      const bookId = local ? local.id : await createRemoteBookRecord(book);
+      await openPlayer(bookId);
       clearDiagLogMarker();
-      progressEl.remove();
-      actionContainer.innerHTML = '';
-      const doneLabel = document.createElement('span');
-      doneLabel.className = 'dl-done';
-      doneLabel.textContent = 'In library';
-      actionContainer.appendChild(doneLabel);
-      if (typeof refreshStorageBar === 'function') refreshStorageBar();
     } catch (e) {
-      await checkpoint('caught error: ' + (e && e.message ? e.message : String(e)));
-      progressEl.textContent = 'Failed' + (e && e.message ? ': ' + e.message : '');
-      btn.disabled = false;
-      setTimeout(() => progressEl.remove(), 4000);
+      await checkpoint('caught error opening remote book: ' + (e && e.message ? e.message : String(e)));
+      alert('Could not open this book: ' + (e && e.message ? e.message : String(e)));
     } finally {
+      btn.disabled = false;
       inFlight.delete(book.id);
     }
   }
 
-  async function downloadBookInner(book, progressEl) {
-      await checkpoint(`fetching "${book.title}"`);
-      const res = await fetch(baseUrl + 'api/books/' + encodeURIComponent(book.id) + '/file');
-      if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
-      const total = Number(res.headers.get('content-length')) || book.sizeBytes || 0;
-      const contentType = res.headers.get('content-type') || 'application/octet-stream';
-
-      // Audiobooks run hundreds of MB to a few GB. Holding every chunk as a
-      // separate JS-visible Uint8Array for the whole download -- easily
-      // thousands of them by the end -- is enough to get a mobile tab killed
-      // for memory pressure partway through, which looks exactly like "hits
-      // 100%, silently reloads, nothing was saved." Flushing chunks into an
-      // intermediate Blob every few MB lets the browser release that raw
-      // memory as it goes, so the resident set stays bounded regardless of
-      // how large the book is.
-      const FLUSH_BYTES = 8 * 1024 * 1024;
-      const reader = res.body.getReader();
-      const parts = [];
-      let buffer = [];
-      let bufferedBytes = 0;
-      let received = 0;
-
-      // Checkpointing every single chunk (there can be thousands) would mean
-      // thousands of IndexedDB transactions during one download -- real
-      // overhead for not much extra diagnostic value. Once per flush (every
-      // ~8MB) is fine-grained enough to pin down where a crash happened
-      // without slowing the download down.
-      const flush = async () => {
-        if (!buffer.length) return;
-        parts.push(new Blob(buffer, { type: contentType }));
-        buffer = [];
-        bufferedBytes = 0;
-        const pct = total ? Math.round((received / total) * 100) : 0;
-        await checkpoint(`streaming "${book.title}": ${pct}% (${parts.length} parts, ${fmtBytesLocal(received)})`);
-      };
-
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer.push(value);
-        bufferedBytes += value.length;
-        received += value.length;
-        if (bufferedBytes >= FLUSH_BYTES) await flush();
-        const pct = total ? Math.round((received / total) * 100) : 0;
-        progressEl.textContent = pct + '%';
-      }
-      await flush();
-
-      progressEl.textContent = 'Saving...';
-      await checkpoint(`combining ${parts.length} parts into one file for "${book.title}" (${fmtBytesLocal(received)})`);
-      const blob = new Blob(parts, { type: contentType });
-      parts.length = 0; // done with the intermediate pieces once combined
-
-      await checkpoint(`verifying playability of "${book.title}"`);
-      // probeFile() decides whether to trust a large file outright (rather
-      // than risk handing it to an <audio> element) based on the filename's
-      // extension -- so this synthetic File needs a real one matching what
-      // the server actually sent, not a generic name that would defeat that
-      // check and route a perfectly fine multi-hundred-MB book through the
-      // exact probe that's proven unsafe at this size.
-      const CONTENT_TYPE_EXT = { 'audio/mp4': 'm4b', 'audio/mpeg': 'mp3', 'audio/flac': 'flac', 'audio/wav': 'wav', 'audio/opus': 'opus' };
-      const probeExt = CONTENT_TYPE_EXT[contentType] || 'm4b';
-      const probe = await probeFile(new File([blob], `downloaded.${probeExt}`, { type: contentType }));
-      if (!probe.playable) throw new Error('This device could not play the downloaded file');
-
-      await checkpoint(`writing "${book.title}" to IndexedDB in chunks (${fmtBytesLocal(blob.size)})`);
-      const blobId = uid();
-      await idbPutBlobChunked(blobId, blob, contentType, (done, count) => {
-        checkpoint(`wrote chunk ${done}/${count} for "${book.title}"`);
-      });
-      await checkpoint(`writing "${book.title}" book record`);
-
-      const bookId = uid();
-      const record = {
-        id: bookId,
-        title: book.title,
-        author: book.author || '',
-        seriesNumber: book.seriesNumber || null,
-        chapters: (book.chapters || []).map((c) => ({ blobId, name: c.name, start: c.start, duration: c.duration })),
-        currentChapterIndex: 0,
-        currentTime: 0,
-        speed: 1,
-        addedDate: Date.now(),
-        lastPlayed: Date.now(),
-        sourceServerId: book.id,
-        sourceServerUrl: baseUrl,
-      };
-      if (!record.chapters.length) {
-        record.chapters = [{ blobId, name: book.title, start: 0, duration: probe.duration || book.duration || 0 }];
-      }
-      await idbPut('books', record);
+  async function createRemoteBookRecord(book) {
+    const streamUrl = baseUrl + 'api/books/' + encodeURIComponent(book.id) + '/file';
+    const bookId = uid();
+    const record = {
+      id: bookId,
+      title: book.title,
+      author: book.author || '',
+      seriesNumber: book.seriesNumber || null,
+      streamUrl,
+      chapters: (book.chapters && book.chapters.length)
+        ? book.chapters.map((c) => ({ name: c.name, start: c.start, duration: c.duration }))
+        : [{ name: book.title, start: 0, duration: book.duration || 0 }],
+      currentChapterIndex: 0,
+      currentTime: 0,
+      speed: 1,
+      addedDate: Date.now(),
+      lastPlayed: Date.now(),
+      sourceServerId: book.id,
+      sourceServerUrl: baseUrl,
+    };
+    await idbPut('books', record);
+    return bookId;
   }
 
   function wire() {

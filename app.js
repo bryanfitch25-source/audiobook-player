@@ -5,7 +5,7 @@
 // Bumped in lockstep with sw.js's CACHE constant. Shown in the UI so there is
 // never any ambiguity, after a service-worker update, about whether the code
 // actually running is the code that was just shipped.
-const APP_VERSION = 'the-pattern-v28'; // must exactly match CACHE in sw.js
+const APP_VERSION = 'the-pattern-v29'; // must exactly match CACHE in sw.js
 
 const DB_NAME = 'audiobook-player';
 const DB_VERSION = 2;
@@ -1397,38 +1397,6 @@ async function keepOffline() {
   }
 }
 
-// ---------- loudness (Web Audio GainNode) ----------
-// Every import is measured for loudness on the PC; the gain to apply is
-// stored per book and routed through a GainNode rather than baked into the
-// audio, so a book imported before this existed just plays at unity gain
-// (gainDb defaults to 0) instead of needing a re-import.
-let audioCtx = null;
-let gainNode = null;
-
-function ensureAudioGraph() {
-  if (audioCtx) return;
-  try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-    audioCtx = new Ctx();
-    const src = audioCtx.createMediaElementSource(audioEl);
-    gainNode = audioCtx.createGain();
-    src.connect(gainNode).connect(audioCtx.destination);
-  } catch (e) {
-    audioCtx = null; // routing through Web Audio is a nice-to-have -- never block plain playback on it failing
-  }
-}
-
-function applyGain() {
-  if (!gainNode) return;
-  const db = (currentBook && currentBook.gainDb) || 0;
-  gainNode.gain.value = Math.pow(10, db / 20);
-}
-
-function resumeAudioGraphIfNeeded() {
-  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
-}
-
 // ---------- player ----------
 async function openPlayer(bookId) {
   const book = normalizeBook(await idbGet('books', bookId));
@@ -1522,7 +1490,6 @@ async function loadChapter(index, offset, autoplay) {
   updateChapterHeading();
   renderChapterList();
   updateMediaSessionMetadata();
-  applyGain();
 
   const useStream = currentBook.streamUrl && !currentBook.offline;
   // A streamed book has one network URL backing every chapter, in place of
@@ -1606,8 +1573,6 @@ function updatePlayPauseIcon() {
 }
 
 function togglePlayPause() {
-  ensureAudioGraph();
-  resumeAudioGraphIfNeeded();
   if (audioEl.paused) audioEl.play().catch(() => {});
   else audioEl.pause();
 }
@@ -1848,7 +1813,6 @@ function wireEvents() {
   audioEl.addEventListener('play', () => {
     updatePlayPauseIcon();
     updateMiniPlayer();
-    resumeAudioGraphIfNeeded();
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
     maintainStreamBuffer(false);
   });

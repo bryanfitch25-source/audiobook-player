@@ -1,4 +1,4 @@
-const CACHE = 'the-pattern-v28';
+const CACHE = 'the-pattern-v29';
 const SHELL = [
   './', './index.html', './style.css', './app.js', './metadata.js', './computer.js', './manifest.json',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png',

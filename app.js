@@ -5,7 +5,7 @@
 // Bumped in lockstep with sw.js's CACHE constant. Shown in the UI so there is
 // never any ambiguity, after a service-worker update, about whether the code
 // actually running is the code that was just shipped.
-const APP_VERSION = 'the-pattern-v30'; // must exactly match CACHE in sw.js
+const APP_VERSION = 'the-pattern-v31'; // must exactly match CACHE in sw.js
 
 const DB_NAME = 'audiobook-player';
 const DB_VERSION = 2;
@@ -410,12 +410,13 @@ let saveProgressTimer = null;
 let connStatusTimer = null;
 let searchQuery = '';
 let activeFilter = 'all';
-let shelveMode = false;
+let currentAuthorView = null; // author name currently shown in view-author, or null
 
 // ---------- DOM ----------
 const $ = (id) => document.getElementById(id);
 const viewLibrary = $('view-library');
 const viewPlayer = $('view-player');
+const viewAuthor = $('view-author');
 const audioEl = $('audio-el');
 
 const libraryList = $('library-list');
@@ -446,7 +447,11 @@ init();
 // until DOMContentLoaded, same as the listener below waits for.
 document.addEventListener('DOMContentLoaded', () => {
   if (window.PCLink) {
-    PCLink.onChange(() => { renderLibrary(); updateConnStatus(); });
+    PCLink.onChange(() => {
+      renderLibrary();
+      updateConnStatus();
+      if (currentAuthorView) openAuthorView(currentAuthorView);
+    });
   }
 });
 
@@ -577,11 +582,26 @@ function matchesSearch(book) {
   return (book.title || '').toLowerCase().includes(q) || (book.author || '').toLowerCase().includes(q);
 }
 
+// Series order beats everything else once it exists -- a numbered book
+// always sorts before an unnumbered one, and two numbered books sort purely
+// on that number, never on title text.
+function compareBooksInOrder(a, b) {
+  const an = a.seriesNumber, bn = b.seriesNumber;
+  if (an != null && bn != null) return an - bn;
+  if (an != null) return -1;
+  if (bn != null) return 1;
+  return (a.title || '').localeCompare(b.title || '');
+}
+
+const UNKNOWN_AUTHOR = 'Unknown';
+
 async function renderLibrary() {
   library = (await idbGetAll('books')).map(normalizeBook);
   let entries = buildCatalogEntries();
 
   entries = entries.filter((e) => e.kind === 'importing' || matchesSearch(e.displayBook));
+  const browsing = !searchQuery && activeFilter === 'all';
+
   if (activeFilter === 'unfinished') {
     entries = entries.filter((e) => e.kind === 'importing' || pctDone(e.displayBook) < 99.5);
   }
@@ -599,9 +619,10 @@ async function renderLibrary() {
   libraryEmpty.classList.toggle('hidden', entries.length > 0);
   updateEmptyStateText();
 
-  if (shelveMode) renderShelved(entries);
+  if (browsing) renderAuthorList(entries);
   else for (const entry of entries) libraryList.appendChild(renderBookRow(entry));
 
+  updateNowListening();
   updateMiniPlayer();
 }
 
@@ -613,34 +634,102 @@ function updateEmptyStateText() {
     : 'Touch the Wheel above to bind a book, or connect to your PC in Settings.';
 }
 
-// Series shelves group by teller (author), since that's the closest thing to
-// a series identity the data actually carries -- every book in a series was
-// imported with the same author, even without a dedicated series-name field.
-function renderShelved(entries) {
-  const shelves = new Map();
-  const standalone = [];
+// The default browsing view: every teller as its own row, tap through to
+// see their books. Groups purely by the author field -- there's no
+// dedicated series-name field, so a teller's books are the closest thing
+// this data has to a series listing.
+function renderAuthorList(entries) {
+  const importing = entries.filter((e) => e.kind === 'importing');
+  for (const e of importing) libraryList.appendChild(renderBookRow(e));
+
+  const byAuthor = new Map();
   for (const e of entries) {
-    if (e.kind !== 'importing' && e.displayBook.seriesNumber && e.displayBook.author) {
-      const key = e.displayBook.author;
-      if (!shelves.has(key)) shelves.set(key, []);
-      shelves.get(key).push(e);
-    } else {
-      standalone.push(e);
-    }
+    if (e.kind === 'importing') continue;
+    const author = (e.displayBook.author || '').trim() || UNKNOWN_AUTHOR;
+    if (!byAuthor.has(author)) byAuthor.set(author, []);
+    byAuthor.get(author).push(e);
   }
-  for (const [author, list] of shelves) {
-    list.sort((a, b) => (a.displayBook.seriesNumber || 0) - (b.displayBook.seriesNumber || 0));
-    const finished = list.filter((e) => pctDone(e.displayBook) >= 99.5).length;
-    const header = document.createElement('div');
-    header.className = 'shelf-header';
-    header.innerHTML = `<span>${escapeHtml(author)}</span><span class="shelf-count">${finished} of ${list.length}</span>`;
-    libraryList.appendChild(header);
+
+  const authors = Array.from(byAuthor.keys()).sort((a, b) => {
+    if (a === UNKNOWN_AUTHOR) return 1;
+    if (b === UNKNOWN_AUTHOR) return -1;
+    return a.localeCompare(b);
+  });
+
+  for (const author of authors) {
+    const list = byAuthor.get(author);
     const row = document.createElement('div');
-    row.className = 'shelf-row';
-    for (const e of list) row.appendChild(renderBookRow(e, true));
+    row.className = 'author-row';
+    const ajah = ajahFor(author);
+    row.innerHTML = `
+      <div class="author-row-initial" style="background:${ajah.color}">${escapeHtml(author[0].toUpperCase())}</div>
+      <div class="author-row-meta">
+        <div class="author-row-name">${escapeHtml(author)}</div>
+        <div class="author-row-count">${list.length} book${list.length === 1 ? '' : 's'}</div>
+      </div>
+      <span class="author-row-chevron">&#8250;</span>
+    `;
+    row.addEventListener('click', () => openAuthorView(author));
     libraryList.appendChild(row);
   }
-  for (const e of standalone) libraryList.appendChild(renderBookRow(e));
+}
+
+// The per-teller page: numeric series order within each half, unfinished
+// books first (what's actually left to read), a divider, then what's done.
+function openAuthorView(author) {
+  currentAuthorView = author;
+  const entries = buildCatalogEntries().filter((e) => e.kind !== 'importing'
+    && ((e.displayBook.author || '').trim() || UNKNOWN_AUTHOR) === author);
+  entries.sort((a, b) => compareBooksInOrder(a.displayBook, b.displayBook));
+
+  const unread = entries.filter((e) => pctDone(e.displayBook) < 99.5);
+  const read = entries.filter((e) => pctDone(e.displayBook) >= 99.5);
+
+  $('author-title').textContent = author;
+  const list = $('author-book-list');
+  list.innerHTML = '';
+  for (const e of unread) list.appendChild(renderBookRow(e));
+  if (unread.length && read.length) {
+    const divider = document.createElement('div');
+    divider.className = 'author-divider';
+    divider.textContent = 'Read';
+    list.appendChild(divider);
+  }
+  for (const e of read) list.appendChild(renderBookRow(e));
+
+  showView('author');
+}
+
+// The card above the author list -- whichever book was most recently
+// touched and isn't finished yet, so picking back up never needs a search.
+function updateNowListening() {
+  const card = $('now-listening');
+  const entries = buildCatalogEntries().filter((e) => e.kind !== 'importing');
+  let best = null;
+  for (const e of entries) {
+    const book = e.displayBook;
+    const pct = pctDone(book);
+    if (pct <= 0 || pct >= 99.5) continue;
+    const touched = book.lastPlayed || book.addedDate || 0;
+    if (!best || touched > (best.displayBook.lastPlayed || best.displayBook.addedDate || 0)) best = e;
+  }
+
+  if (!best) { card.classList.add('hidden'); return; }
+  card.classList.remove('hidden');
+  const book = best.displayBook;
+  const ajah = ajahFor(book.title || book.id);
+  $('now-listening-cover').textContent = (book.title || '?')[0].toUpperCase();
+  $('now-listening-cover').style.background = ajah.color;
+  $('now-listening-title').textContent = book.title;
+  const ch = book.chapters[book.currentChapterIndex];
+  $('now-listening-sub').textContent = ch ? ch.name : '';
+  $('now-listening-fill').style.width = pctDone(book) + '%';
+
+  const cardEl = $('now-listening-card');
+  cardEl.onclick = () => {
+    if (best.kind === 'stream') openPlayerWithBook(book);
+    else openPlayer(book.id);
+  };
 }
 
 function renderBookRow(entry, compact) {
@@ -888,6 +977,22 @@ function openStreakModal() {
   $('streak-flavor').textContent = flavorForStreak(current)
     || (current > 0 ? 'The thread holds. Keep the Wheel turning.' : 'Listen today to begin a new thread.');
   renderStreakHeatmap(days);
+
+  const entries = buildCatalogEntries().filter((e) => e.kind !== 'importing');
+  const authors = new Set();
+  let finished = 0;
+  let elapsedSeconds = 0;
+  for (const e of entries) {
+    const book = e.displayBook;
+    if (book.author) authors.add(book.author.trim());
+    if (pctDone(book) >= 99.5) finished++;
+    elapsedSeconds += book.chapters.slice(0, book.currentChapterIndex).reduce((s, c) => s + (c.duration || 0), 0) + (book.currentTime || 0);
+  }
+  $('lib-stat-books').textContent = entries.length;
+  $('lib-stat-finished').textContent = finished;
+  $('lib-stat-hours').textContent = Math.round(elapsedSeconds / 3600);
+  $('lib-stat-authors').textContent = authors.size;
+
   $('modal-streak').classList.remove('hidden');
 }
 
@@ -906,7 +1011,9 @@ function showStreakToast(text) {
 // ---------- navigation ----------
 function showView(name) {
   viewLibrary.classList.toggle('active', name === 'library');
+  viewAuthor.classList.toggle('active', name === 'author');
   viewPlayer.classList.toggle('active', name === 'player');
+  if (name !== 'author') currentAuthorView = null;
   updateMiniPlayer();
   updateConnStatus();
 }
@@ -1881,7 +1988,7 @@ function wireEvents() {
   });
   window.addEventListener('beforeunload', () => saveProgress());
 
-  // ---------- search / filter / shelve ----------
+  // ---------- search / filter ----------
   $('btn-search-toggle').addEventListener('click', () => $('search-bar').classList.toggle('hidden'));
   $('search-input').addEventListener('input', (e) => { searchQuery = e.target.value; renderLibrary(); });
   document.querySelectorAll('.chip[data-filter]').forEach((chip) => {
@@ -1892,14 +1999,9 @@ function wireEvents() {
       renderLibrary();
     });
   });
-  const shelveChip = document.querySelector('.chip[data-shelve]');
-  if (shelveChip) {
-    shelveChip.addEventListener('click', () => {
-      shelveMode = !shelveMode;
-      shelveChip.classList.toggle('active', shelveMode);
-      renderLibrary();
-    });
-  }
+
+  // ---------- author page ----------
+  $('btn-author-back').addEventListener('click', () => showView('library'));
 
   // ---------- settings sheet ----------
   $('btn-settings').addEventListener('click', () => $('modal-settings').classList.remove('hidden'));

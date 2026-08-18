@@ -75,7 +75,9 @@ body::before {
   50% { filter: drop-shadow(0 0 4px rgba(232,201,121,0.8)); }
 }
 
-.streak-stats { display: flex; gap: 10px; margin: 6px 0 16px; }
+.stats-subhead { font-size: 15px; font-weight: 400; color: var(--gold-bright); margin: 22px 0 4px; padding-top: 16px; border-top: 1px solid rgba(201,163,78,0.15); }
+.streak-stats { display: flex; gap: 10px; margin: 6px 0 16px; flex-wrap: wrap; }
+.streak-stats.grid-4 .streak-stat { flex-basis: calc(50% - 5px); }
 .streak-stat {
   flex: 1;
   text-align: center;
@@ -376,6 +378,93 @@ body::before {
   flex-shrink: 0;
 }
 .icon-btn:active { background: var(--leather-2); }
+.icon-btn-spacer { width: 40px; height: 40px; flex-shrink: 0; }
+
+/* ---------- currently listening ---------- */
+.now-listening { padding: 0 20px 16px; }
+.now-listening.hidden { display: none; }
+.now-listening-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--gold);
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.now-listening-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px;
+  border-radius: 4px;
+  background: linear-gradient(135deg, rgba(201,163,78,0.16), rgba(23,19,16,0.55));
+  border: 1px solid var(--gold-dim);
+}
+.now-listening-card:active { background: rgba(201,163,78,0.22); }
+.now-listening-cover {
+  width: 58px;
+  height: 58px;
+  border-radius: 3px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  font-weight: 600;
+  color: var(--parchment);
+  border: 1px solid rgba(236,224,200,0.25);
+  text-shadow: 0 1px 3px rgba(0,0,0,0.6);
+}
+.now-listening-meta { flex: 1; min-width: 0; }
+.now-listening-title { font-size: 16px; color: var(--gold-bright); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.now-listening-sub { font-size: 12px; color: var(--parchment-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 2px 0 8px; font-style: italic; }
+
+/* ---------- author list / author books page ---------- */
+.author-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 12px;
+  border-radius: 4px;
+  margin-bottom: 8px;
+  background: linear-gradient(180deg, rgba(42,34,26,0.55), rgba(23,19,16,0.55));
+  border: 1px solid rgba(201,163,78,0.16);
+}
+.author-row:active { background: var(--leather-2); }
+.author-row-initial {
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 19px;
+  font-weight: 600;
+  color: var(--ink);
+  background: var(--gold);
+}
+.author-row-meta { flex: 1; min-width: 0; }
+.author-row-name { font-size: 16px; color: var(--parchment); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.author-row-count { font-size: 12px; color: var(--parchment-dim); margin-top: 2px; }
+.author-row-chevron { color: var(--gold-dim); font-size: 18px; flex-shrink: 0; }
+
+.author-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 20px 6px 10px;
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--gold);
+}
+.author-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, var(--gold-dim), transparent);
+}
 
 /* ---------- storage ---------- */
 .storage-bar { display: flex; align-items: center; gap: 10px; padding: 0 20px 14px; }

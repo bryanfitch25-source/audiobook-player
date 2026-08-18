@@ -76,6 +76,13 @@ const PCLink = (() => {
    * periodic push a few seconds later covers for it. */
   async function pushProgress(serverId, currentTime, currentChapterIndex) {
     if (!baseUrl) return;
+    // Updated in the local catalog cache immediately, not just pushed to the
+    // server -- anything rendered from getCatalog() (the author page, the
+    // currently-listening card, finished/unread splits) reads that cache
+    // directly, and would otherwise keep showing the position from whenever
+    // the catalog was last fully refreshed instead of just now.
+    const book = catalog.find((b) => b.id === serverId);
+    if (book) book.progress = { currentTime, currentChapterIndex, updatedAt: Date.now() };
     try {
       await fetch(baseUrl + 'api/books/' + encodeURIComponent(serverId) + '/progress', {
         method: 'POST',

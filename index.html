@@ -64,7 +64,18 @@
         <button class="chip active" data-filter="all">All</button>
         <button class="chip" data-filter="unfinished">Unfinished</button>
         <button class="chip" data-filter="newest">Newest</button>
-        <button class="chip" data-shelve="1">Shelve by teller</button>
+      </div>
+    </div>
+
+    <div id="now-listening" class="now-listening hidden">
+      <div class="now-listening-label">Currently Listening</div>
+      <div class="now-listening-card" id="now-listening-card">
+        <div class="now-listening-cover" id="now-listening-cover">A</div>
+        <div class="now-listening-meta">
+          <div class="now-listening-title" id="now-listening-title">Title</div>
+          <div class="now-listening-sub" id="now-listening-sub">Chapter</div>
+          <div class="book-progress-track"><div class="book-progress-fill" id="now-listening-fill" style="width:0%"></div></div>
+        </div>
       </div>
     </div>
 
@@ -82,6 +93,16 @@
     <div id="library-list" class="library-list"></div>
     <p class="tagline">The Wheel weaves as the Wheel wills.</p>
     <p id="app-version" class="app-version"></p>
+  </section>
+
+  <!-- AUTHOR BOOKS -->
+  <section id="view-author" class="view">
+    <header class="topbar">
+      <button id="btn-author-back" class="icon-btn" aria-label="Back to the Pattern">&#8592;</button>
+      <h1 id="author-title">Teller</h1>
+      <span class="icon-btn-spacer"></span>
+    </header>
+    <div id="author-book-list" class="library-list"></div>
   </section>
 
   <!-- PLAYER -->
@@ -229,10 +250,18 @@
     </div>
   </div>
 
-  <!-- LISTENING STREAK -->
+  <!-- STATS -->
   <div id="modal-streak" class="modal hidden">
     <div class="modal-card">
-      <h2>Threads Unbroken</h2>
+      <h2>The Pattern So Far</h2>
+      <div class="streak-stats grid-4">
+        <div class="streak-stat"><span id="lib-stat-books" class="streak-num">0</span><span class="streak-label">Books</span></div>
+        <div class="streak-stat"><span id="lib-stat-finished" class="streak-num">0</span><span class="streak-label">Finished</span></div>
+        <div class="streak-stat"><span id="lib-stat-hours" class="streak-num">0</span><span class="streak-label">Hours in</span></div>
+        <div class="streak-stat"><span id="lib-stat-authors" class="streak-num">0</span><span class="streak-label">Tellers</span></div>
+      </div>
+
+      <h2 class="stats-subhead">Threads Unbroken</h2>
       <div class="streak-stats">
         <div class="streak-stat"><span id="streak-current" class="streak-num">0</span><span class="streak-label">Day streak</span></div>
         <div class="streak-stat"><span id="streak-longest" class="streak-num">0</span><span class="streak-label">Longest</span></div>

@@ -1,9 +1,11 @@
-/* Local-storage audiobook player. All audio data lives in IndexedDB on this device. */
+/* The Pattern -- unified audiobook player. Local imports live in IndexedDB on
+ * this device; PC books stream straight from the server with no on-device
+ * copy unless explicitly kept offline. The catalog merges both into one list. */
 
 // Bumped in lockstep with sw.js's CACHE constant. Shown in the UI so there is
 // never any ambiguity, after a service-worker update, about whether the code
 // actually running is the code that was just shipped.
-const APP_VERSION = 'the-pattern-v26'; // must exactly match CACHE in sw.js
+const APP_VERSION = 'the-pattern-v27'; // must exactly match CACHE in sw.js
 
 const DB_NAME = 'audiobook-player';
 const DB_VERSION = 2;
@@ -128,13 +130,21 @@ const CHUNKS_PER_TRANSACTION = 8; // 32MB/transaction at the chunk size above
  * request for the live stream fails. Byte ranges rather than time ranges,
  * since that's what the server actually understands; the current byte
  * position is only an estimate from the book's overall average bitrate,
- * which is fine for deciding how far ahead to prefetch. */
+ * which is fine for deciding how far ahead to prefetch. The window itself is
+ * a user setting (10/30/60 min), not fixed -- read from localStorage so it
+ * survives a reload. */
 const STREAM_BUFFER_CHUNK_BYTES = 1 * 1024 * 1024; // 1MB per prefetched piece
-const STREAM_BUFFER_AHEAD_SECONDS = 30 * 60; // keep ~30 minutes ready ahead of playback
 const STREAM_BUFFER_EVICT_MARGIN_BYTES = STREAM_BUFFER_CHUNK_BYTES * 2; // small cushion behind playback before dropping old chunks
 const STREAM_BUFFER_MIN_INTERVAL_MS = 15000;
+const BUFFER_MINUTES_KEY = 'stream-buffer-minutes';
+let STREAM_BUFFER_AHEAD_SECONDS = (Number(localStorage.getItem(BUFFER_MINUTES_KEY)) || 30) * 60;
 let streamBufferRunning = false;
 let streamBufferLastRun = 0;
+
+function setBufferMinutes(min) {
+  STREAM_BUFFER_AHEAD_SECONDS = min * 60;
+  localStorage.setItem(BUFFER_MINUTES_KEY, String(min));
+}
 
 function streamBufferCacheName(streamUrl) {
   return 'stream-buf:' + streamUrl;
@@ -263,10 +273,10 @@ async function idbGetReconstitutedBlob(blobId) {
 }
 
 /* Shared diagnostic log, written from both import paths (local file picker
- * and My Computer download) so a crash in either one is equally visible.
- * IndexedDB, not localStorage: a hard OS-level process kill can lose a
- * localStorage write even after it appeared to succeed, since the browser
- * doesn't always flush it to disk synchronously, but an IndexedDB
+ * and the "keep offline" download) so a crash in either one is equally
+ * visible. IndexedDB, not localStorage: a hard OS-level process kill can
+ * lose a localStorage write even after it appeared to succeed, since the
+ * browser doesn't always flush it to disk synchronously, but an IndexedDB
  * transaction's completion callback is a real durability guarantee. */
 const DIAG_LOG_STORE = 'diagLog';
 const DIAG_LOG_CAP = 500;
@@ -362,13 +372,45 @@ function normalizeBook(book) {
   return book;
 }
 
+/* Turns a PC catalog entry (from PCLink) into the same shape a local `books`
+ * record has, so every rendering/playback function only ever has to know one
+ * book shape regardless of where it came from. Not persisted to IndexedDB --
+ * this is rebuilt fresh from the live catalog every time, which is what lets
+ * "My Computer" and "Library" be the same list with no separate add step. */
+function remoteToBookShape(rb) {
+  const p = rb.progress || {};
+  return {
+    id: 'remote:' + rb.id,
+    title: rb.title,
+    author: rb.author || '',
+    seriesNumber: rb.seriesNumber || null,
+    chapters: (rb.chapters && rb.chapters.length)
+      ? rb.chapters.map((c) => ({ name: c.name, start: c.start, duration: c.duration }))
+      : [{ name: rb.title, start: 0, duration: rb.duration || 0 }],
+    currentChapterIndex: p.currentChapterIndex || 0,
+    currentTime: p.currentTime || 0,
+    addedDate: rb.addedDate || 0,
+    lastPlayed: p.updatedAt || rb.addedDate || 0,
+    speed: 1,
+    sizeBytes: rb.sizeBytes || 0,
+    gainDb: rb.gainDb || 0,
+    streamUrl: PCLink.streamUrlFor(rb.id),
+    sourceServerId: rb.id,
+    sourceServerUrl: PCLink.getBaseUrl(),
+  };
+}
+
 // ---------- state ----------
-let library = [];        // array of book metadata objects
+let library = [];        // array of local book records (imports + offline copies)
 let currentBook = null;  // book currently open in player
 let currentBlobUrl = null;
-let loadedBlobId = null; // which blob is currently in the audio element
+let loadedBlobId = null; // which blob/stream is currently in the audio element
 let sleepTimer = { deadline: null, mode: 'off', intervalId: null };
 let saveProgressTimer = null;
+let connStatusTimer = null;
+let searchQuery = '';
+let activeFilter = 'all';
+let shelveMode = false;
 
 // ---------- DOM ----------
 const $ = (id) => document.getElementById(id);
@@ -398,14 +440,30 @@ let fileStatus = []; // parallel to pickedFiles: { state, duration }
 // ---------- init ----------
 init();
 
+// Registered here (top-level, runs while this script is still being parsed,
+// well before DOMContentLoaded fires) rather than inside init() -- computer.js
+// hasn't run yet at this point in the script, so window.PCLink doesn't exist
+// until DOMContentLoaded, same as the listener below waits for.
+document.addEventListener('DOMContentLoaded', () => {
+  if (window.PCLink) {
+    PCLink.onChange(() => { renderLibrary(); updateConnStatus(); });
+  }
+});
+
 async function init() {
   await openDb();
-  await refreshLibrary();
+  await renderLibrary();
   await refreshStorageBar();
   wireEvents();
   registerServiceWorker();
   showView('library');
   cleanupOrphanedBlobChunks(); // fire-and-forget housekeeping, not on the critical path
+
+  updateConnStatus();
+  if (connStatusTimer) clearInterval(connStatusTimer);
+  connStatusTimer = setInterval(updateConnStatus, 15000);
+  window.addEventListener('online', updateConnStatus);
+  window.addEventListener('offline', updateConnStatus);
 }
 
 /* Before idbPutBlobChunked cleaned up after itself on failure, a crashed or
@@ -476,40 +534,154 @@ async function checkVersionMatch() {
   }
 }
 
-// ---------- library rendering ----------
-async function refreshLibrary() {
-  library = (await idbGetAll('books')).map(normalizeBook);
-  library.sort((a, b) => (b.lastPlayed || b.addedDate) - (a.lastPlayed || a.addedDate));
-  libraryList.innerHTML = '';
-  libraryEmpty.classList.toggle('hidden', library.length > 0);
-  for (const book of library) {
-    libraryList.appendChild(renderBookRow(book));
+// ---------- unified catalog ----------
+
+/* Merges local IndexedDB books (plain imports + explicit offline copies)
+ * with the live PC catalog (streamed, no local copy) and whatever import is
+ * currently running on the PC -- one list, not two tabs. A PC book that's
+ * been kept offline is shown using its local record (real chapters, real
+ * blobIds) instead of a duplicate streaming entry. */
+function buildCatalogEntries() {
+  const localByServerId = new Map();
+  for (const b of library) if (b.sourceServerId) localByServerId.set(b.sourceServerId, b);
+
+  const entries = [];
+  for (const b of library) {
+    entries.push({ kind: b.offline ? 'offline' : 'local', displayBook: b });
   }
+
+  if (window.PCLink && PCLink.isConnected()) {
+    for (const rb of PCLink.getCatalog()) {
+      if (localByServerId.has(rb.id)) continue;
+      entries.push({ kind: 'stream', displayBook: remoteToBookShape(rb) });
+    }
+    const imp = PCLink.getCurrentImport();
+    if (imp && imp.status === 'running' && !PCLink.getCatalog().some((b) => b.title === imp.title)) {
+      entries.push({ kind: 'importing', imp });
+    }
+  }
+  return entries;
 }
 
-function renderBookRow(book) {
-  const li = document.createElement('li');
-  li.className = 'book-row';
+function pctDone(book) {
+  const totalDur = book.chapters.reduce((s, c) => s + (c.duration || 0), 0);
+  const elapsed = book.chapters.slice(0, book.currentChapterIndex).reduce((s, c) => s + (c.duration || 0), 0) + (book.currentTime || 0);
+  return totalDur > 0 ? Math.min(100, (elapsed / totalDur) * 100) : 0;
+}
+
+function matchesSearch(book) {
+  if (!searchQuery) return true;
+  const q = searchQuery.toLowerCase();
+  return (book.title || '').toLowerCase().includes(q) || (book.author || '').toLowerCase().includes(q);
+}
+
+async function renderLibrary() {
+  library = (await idbGetAll('books')).map(normalizeBook);
+  let entries = buildCatalogEntries();
+
+  entries = entries.filter((e) => e.kind === 'importing' || matchesSearch(e.displayBook));
+  if (activeFilter === 'unfinished') {
+    entries = entries.filter((e) => e.kind === 'importing' || pctDone(e.displayBook) < 99.5);
+  }
+  if (activeFilter === 'newest') {
+    entries.sort((a, b) => (b.kind === 'importing' ? 1 : (b.displayBook.addedDate || 0)) - (a.kind === 'importing' ? 1 : (a.displayBook.addedDate || 0)));
+  } else {
+    entries.sort((a, b) => {
+      if (a.kind === 'importing') return -1;
+      if (b.kind === 'importing') return 1;
+      return (b.displayBook.lastPlayed || b.displayBook.addedDate || 0) - (a.displayBook.lastPlayed || a.displayBook.addedDate || 0);
+    });
+  }
+
+  libraryList.innerHTML = '';
+  libraryEmpty.classList.toggle('hidden', entries.length > 0);
+  updateEmptyStateText();
+
+  if (shelveMode) renderShelved(entries);
+  else for (const entry of entries) libraryList.appendChild(renderBookRow(entry));
+
+  updateMiniPlayer();
+}
+
+function updateEmptyStateText() {
+  const connected = window.PCLink && PCLink.isConnected();
+  $('library-empty-text').textContent = connected ? 'No books yet.' : 'The Pattern holds no threads yet.';
+  $('library-empty-sub').textContent = connected
+    ? 'Import a book on your PC to see it appear here.'
+    : 'Touch the Wheel above to bind a book, or connect to your PC in Settings.';
+}
+
+// Series shelves group by teller (author), since that's the closest thing to
+// a series identity the data actually carries -- every book in a series was
+// imported with the same author, even without a dedicated series-name field.
+function renderShelved(entries) {
+  const shelves = new Map();
+  const standalone = [];
+  for (const e of entries) {
+    if (e.kind !== 'importing' && e.displayBook.seriesNumber && e.displayBook.author) {
+      const key = e.displayBook.author;
+      if (!shelves.has(key)) shelves.set(key, []);
+      shelves.get(key).push(e);
+    } else {
+      standalone.push(e);
+    }
+  }
+  for (const [author, list] of shelves) {
+    list.sort((a, b) => (a.displayBook.seriesNumber || 0) - (b.displayBook.seriesNumber || 0));
+    const finished = list.filter((e) => pctDone(e.displayBook) >= 99.5).length;
+    const header = document.createElement('div');
+    header.className = 'shelf-header';
+    header.innerHTML = `<span>${escapeHtml(author)}</span><span class="shelf-count">${finished} of ${list.length}</span>`;
+    libraryList.appendChild(header);
+    const row = document.createElement('div');
+    row.className = 'shelf-row';
+    for (const e of list) row.appendChild(renderBookRow(e, true));
+    libraryList.appendChild(row);
+  }
+  for (const e of standalone) libraryList.appendChild(renderBookRow(e));
+}
+
+function renderBookRow(entry, compact) {
+  const li = document.createElement('div');
+  li.className = 'book-row' + (compact ? ' compact' : '');
+
+  if (entry.kind === 'importing') {
+    li.classList.add('importing-row');
+    const pct = Math.round((entry.imp.percent || 0) * 100);
+    li.innerHTML = `
+      <div class="book-cover importing-cover">&#8635;</div>
+      <div class="book-meta">
+        <div class="book-title">${escapeHtml(entry.imp.title || 'Importing')}</div>
+        <div class="book-sub">${escapeHtml(entry.imp.label || 'Importing...')} &middot; ${pct}%</div>
+      </div>`;
+    return li;
+  }
+
+  const book = entry.displayBook;
   const ajah = ajahFor(book.title || book.id);
   li.style.setProperty('--ajah', ajah.color);
   const totalDur = book.chapters.reduce((s, c) => s + (c.duration || 0), 0);
   const elapsed = book.chapters.slice(0, book.currentChapterIndex).reduce((s, c) => s + (c.duration || 0), 0) + (book.currentTime || 0);
-  const pct = totalDur > 0 ? Math.min(100, (elapsed / totalDur) * 100) : 0;
+  const pct = pctDone(book);
   const remaining = Math.max(0, totalDur - elapsed);
   const nCh = book.chapters.length;
   const badge = book.seriesNumber ? `<div class="series-badge">${escapeHtml(String(book.seriesNumber))}</div>` : '';
-  const streamTag = book.streamUrl ? '<span class="stream-tag">Streaming</span>' : '';
+  const tag = entry.kind === 'stream' ? '<span class="stream-tag">Streaming</span>'
+    : entry.kind === 'offline' ? '<span class="stream-tag offline-tag">Offline copy</span>' : '';
 
   li.innerHTML = `
     <div class="book-cover" style="background:linear-gradient(150deg, ${ajah.color}, rgba(0,0,0,0.75))">${badge}${escapeHtml((book.title || '?')[0].toUpperCase())}</div>
     <div class="book-meta">
-      <div class="book-title">${escapeHtml(book.title)}${streamTag}</div>
+      <div class="book-title">${escapeHtml(book.title)}${tag}</div>
       <div class="book-author">${escapeHtml(book.author || `${nCh} chapter${nCh === 1 ? '' : 's'}`)}</div>
       <div class="book-progress-track"><div class="book-progress-fill" style="width:${pct}%"></div></div>
       <div class="book-sub">${pct >= 99.5 ? 'The Wheel turns' : fmtTime(remaining) + ' remaining'}</div>
     </div>
   `;
-  li.addEventListener('click', () => openPlayer(book.id));
+  li.addEventListener('click', () => {
+    if (entry.kind === 'stream') openPlayerWithBook(book);
+    else openPlayer(book.id);
+  });
   return li;
 }
 
@@ -531,18 +703,53 @@ function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// ---------- connection / buffer status ----------
+function updateConnStatus() {
+  const barLib = $('conn-status');
+  const connected = window.PCLink && PCLink.isConnected();
+  if (!connected) {
+    barLib.classList.add('hidden');
+    $('player-conn-status').classList.add('hidden');
+    return;
+  }
+  const offline = !navigator.onLine;
+  barLib.textContent = offline ? 'Signal lost -- streamed books will pause when their buffer runs out' : 'Connected to your PC';
+  barLib.className = 'conn-status ' + (offline ? 'warn' : 'ok');
+  barLib.classList.remove('hidden');
+
+  if (currentBook && currentBook.streamUrl && !currentBook.offline && viewPlayer.classList.contains('active')) {
+    updatePlayerConnStatus();
+  } else {
+    $('player-conn-status').classList.add('hidden');
+  }
+}
+
+async function updatePlayerConnStatus() {
+  const el = $('player-conn-status');
+  if (!currentBook || !currentBook.streamUrl || currentBook.offline) { el.classList.add('hidden'); return; }
+  let minutesBuffered = 0;
+  try {
+    if ('caches' in window) {
+      const cache = await caches.open(streamBufferCacheName(currentBook.streamUrl));
+      const keys = await cache.keys();
+      const bytesPerSecond = (currentBook.sizeBytes || 0) / (audioEl.duration || 1);
+      if (bytesPerSecond > 0) minutesBuffered = Math.round((keys.length * STREAM_BUFFER_CHUNK_BYTES) / bytesPerSecond / 60);
+    }
+  } catch (e) {}
+  const offline = !navigator.onLine;
+  el.textContent = offline
+    ? `Signal lost -- playing from buffer (~${minutesBuffered}m banked)`
+    : `Streaming -- ~${minutesBuffered}m buffered ahead`;
+  el.className = 'conn-status inline ' + (offline ? 'warn' : 'ok');
+  el.classList.remove('hidden');
+}
+
 // ---------- navigation ----------
 function showView(name) {
   viewLibrary.classList.toggle('active', name === 'library');
   viewPlayer.classList.toggle('active', name === 'player');
-  $('view-computer').classList.toggle('active', name === 'computer');
-
-  const tabbar = $('tabbar');
-  tabbar.classList.toggle('visible', name !== 'player');
-  $('tab-library').classList.toggle('active', name === 'library');
-  $('tab-computer').classList.toggle('active', name === 'computer');
-
-  if (name === 'computer' && window.ComputerTab) window.ComputerTab.onShow();
+  updateMiniPlayer();
+  updateConnStatus();
 }
 
 // ---------- add book flow ----------
@@ -941,17 +1148,136 @@ async function confirmAddBookInner(title, author) {
 
   importProgress.classList.add('hidden');
   closeAddModal();
-  await refreshLibrary();
+  await renderLibrary();
   await refreshStorageBar();
   if (failures.length) {
     alert(`Added "${title}" with ${chapters.length} chapter${chapters.length === 1 ? '' : 's'}.\n\nSkipped:\n` + failures.join('\n'));
   }
 }
 
+// ---------- keep offline (opt-in copy of a streamed book) ----------
+async function keepOffline() {
+  if (!currentBook || !currentBook.streamUrl || currentBook.offline) return;
+  const btn = $('btn-keep-offline');
+  const original = currentBook;
+  btn.disabled = true;
+  try {
+    await checkpoint(`keep offline: fetching "${original.title}"`);
+    const res = await fetch(original.streamUrl);
+    if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+    const contentType = res.headers.get('content-type') || 'application/octet-stream';
+    const total = Number(res.headers.get('content-length')) || original.sizeBytes || 0;
+
+    // Same bounded-memory flush pattern the old download path used: hold
+    // only a few MB of raw chunks in JS at a time, not the whole file.
+    const FLUSH_BYTES = 8 * 1024 * 1024;
+    const reader = res.body.getReader();
+    const parts = [];
+    let buffer = [];
+    let bufferedBytes = 0;
+    let received = 0;
+    const flush = () => {
+      if (!buffer.length) return;
+      parts.push(new Blob(buffer, { type: contentType }));
+      buffer = [];
+      bufferedBytes = 0;
+    };
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer.push(value);
+      bufferedBytes += value.length;
+      received += value.length;
+      if (bufferedBytes >= FLUSH_BYTES) flush();
+      const pct = total ? Math.round((received / total) * 100) : 0;
+      btn.textContent = `Keeping offline... ${pct}%`;
+    }
+    flush();
+    const blob = new Blob(parts, { type: contentType });
+    parts.length = 0;
+
+    await checkpoint(`keep offline: writing "${original.title}" to IndexedDB in chunks (${fmtBytes(blob.size)})`);
+    const blobId = uid();
+    await idbPutBlobChunked(blobId, blob, contentType, (done, count) => {
+      btn.textContent = `Saving... ${Math.round((done / count) * 100)}%`;
+    });
+
+    const record = {
+      id: uid(),
+      title: original.title,
+      author: original.author,
+      seriesNumber: original.seriesNumber,
+      chapters: original.chapters.map((c) => ({ blobId, name: c.name, start: c.start, duration: c.duration })),
+      currentChapterIndex: original.currentChapterIndex,
+      currentTime: original.currentTime,
+      speed: original.speed || 1,
+      addedDate: Date.now(),
+      lastPlayed: Date.now(),
+      offline: true,
+      streamUrl: original.streamUrl,
+      gainDb: original.gainDb || 0,
+      sourceServerId: original.sourceServerId,
+      sourceServerUrl: original.sourceServerUrl,
+    };
+    await idbPut('books', record);
+    clearDiagLogMarker();
+
+    currentBook = normalizeBook(record);
+    loadedBlobId = null; // force loadChapter to re-source from the new local blob next time it plays
+    btn.classList.add('hidden');
+    $('btn-delete-book').classList.remove('hidden');
+    updateConnStatus();
+    await renderLibrary();
+    await refreshStorageBar();
+  } catch (e) {
+    await checkpoint('keep offline: failed: ' + (e && e.message ? e.message : String(e)));
+    alert('Could not save this book offline: ' + (e && e.message ? e.message : String(e)));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Keep this book offline';
+  }
+}
+
+// ---------- loudness (Web Audio GainNode) ----------
+// Every import is measured for loudness on the PC; the gain to apply is
+// stored per book and routed through a GainNode rather than baked into the
+// audio, so a book imported before this existed just plays at unity gain
+// (gainDb defaults to 0) instead of needing a re-import.
+let audioCtx = null;
+let gainNode = null;
+
+function ensureAudioGraph() {
+  if (audioCtx) return;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    audioCtx = new Ctx();
+    const src = audioCtx.createMediaElementSource(audioEl);
+    gainNode = audioCtx.createGain();
+    src.connect(gainNode).connect(audioCtx.destination);
+  } catch (e) {
+    audioCtx = null; // routing through Web Audio is a nice-to-have -- never block plain playback on it failing
+  }
+}
+
+function applyGain() {
+  if (!gainNode) return;
+  const db = (currentBook && currentBook.gainDb) || 0;
+  gainNode.gain.value = Math.pow(10, db / 20);
+}
+
+function resumeAudioGraphIfNeeded() {
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+}
+
 // ---------- player ----------
 async function openPlayer(bookId) {
   const book = normalizeBook(await idbGet('books', bookId));
   if (!book) return;
+  await openPlayerWithBook(book);
+}
+
+async function openPlayerWithBook(book) {
   currentBook = book;
   $('player-title').textContent = book.title;
   const ajah = ajahFor(book.title || book.id);
@@ -966,10 +1292,17 @@ async function openPlayer(bookId) {
     $('cover-art').appendChild(badgeEl);
   }
   $('speed-select').value = String(book.speed || 1);
+
+  const isPureStream = !!(book.streamUrl && !book.offline);
+  $('btn-delete-book').classList.toggle('hidden', isPureStream);
+  $('btn-keep-offline').classList.toggle('hidden', !isPureStream);
+  $('btn-keep-offline').textContent = 'Keep this book offline';
+
   renderChapterList();
   showView('player');
   await loadChapter(book.currentChapterIndex, book.currentTime, false);
   clearSleepTimer();
+  updateConnStatus();
 }
 
 function renderChapterList() {
@@ -999,6 +1332,18 @@ function updateChapterHeading() {
   $('chapter-name').textContent = `${currentBook.currentChapterIndex + 1}. ${ch.name}`;
 }
 
+// Cross-device resume: a pure-stream book's position lives on the server,
+// not in this device's IndexedDB -- an offline copy or local import still
+// persists locally exactly as before.
+function persistBookState() {
+  if (!currentBook) return;
+  if (currentBook.streamUrl && !currentBook.offline) {
+    if (window.PCLink) PCLink.pushProgress(currentBook.sourceServerId, currentBook.currentTime, currentBook.currentChapterIndex);
+  } else {
+    idbPut('books', currentBook);
+  }
+}
+
 async function loadChapter(index, offset, autoplay) {
   if (!currentBook) return;
   if (index < 0 || index >= currentBook.chapters.length) return;
@@ -1013,16 +1358,18 @@ async function loadChapter(index, offset, autoplay) {
   currentBook.currentChapterIndex = index;
   currentBook.currentTime = rel;
   currentBook.lastPlayed = Date.now();
-  idbPut('books', currentBook);
+  persistBookState();
 
   updateChapterHeading();
   renderChapterList();
   updateMediaSessionMetadata();
+  applyGain();
 
+  const useStream = currentBook.streamUrl && !currentBook.offline;
   // A streamed book has one network URL backing every chapter, in place of
   // a blobId backing an on-device blob -- same "which source is currently
   // loaded" check either way, just a different kind of key.
-  const srcKey = currentBook.streamUrl || ch.blobId;
+  const srcKey = useStream ? currentBook.streamUrl : ch.blobId;
 
   // Chapters inside the same file need only a seek, not a reload.
   if (srcKey === loadedBlobId && audioEl.readyState > 0) {
@@ -1034,7 +1381,7 @@ async function loadChapter(index, offset, autoplay) {
 
   if (currentBlobUrl) { URL.revokeObjectURL(currentBlobUrl); currentBlobUrl = null; }
 
-  if (currentBook.streamUrl) {
+  if (useStream) {
     // Streamed books play straight off the PC server's URL -- the browser's
     // own HTTP client handles Range requests for seeking natively, no local
     // storage write involved at all.
@@ -1056,13 +1403,14 @@ async function loadChapter(index, offset, autoplay) {
     // probe timed out on a large file rather than getting a real answer.
     if (!(ch.duration > 0) && isFinite(audioEl.duration) && audioEl.duration > 0) {
       ch.duration = audioEl.duration;
-      idbPut('books', currentBook);
+      persistBookState();
       renderChapterList();
     }
     audioEl.currentTime = Math.min(abs, audioEl.duration || abs);
     if (autoplay) audioEl.play().catch(() => {});
     updatePlayPauseIcon();
-    if (currentBook.streamUrl) maintainStreamBuffer(true);
+    if (useStream) maintainStreamBuffer(true);
+    updateConnStatus();
   };
   audioEl.addEventListener('loadedmetadata', onReady);
 }
@@ -1093,10 +1441,14 @@ function checkChapterBoundary() {
 }
 
 function updatePlayPauseIcon() {
-  $('btn-playpause').innerHTML = audioEl.paused ? '&#9654;' : '&#10074;&#10074;';
+  const icon = audioEl.paused ? '&#9654;' : '&#10074;&#10074;';
+  $('btn-playpause').innerHTML = icon;
+  $('btn-mini-playpause').innerHTML = icon;
 }
 
 function togglePlayPause() {
+  ensureAudioGraph();
+  resumeAudioGraphIfNeeded();
   if (audioEl.paused) audioEl.play().catch(() => {});
   else audioEl.pause();
 }
@@ -1143,23 +1495,22 @@ function saveProgress() {
   if (audioEl.readyState === 0) return; // mid src-swap: currentTime is not yet meaningful
   currentBook.currentTime = chapterElapsed();
   currentBook.lastPlayed = Date.now();
-  idbPut('books', currentBook);
+  persistBookState();
 }
 
 async function deleteCurrentBook() {
   if (!currentBook) return;
-  const msg = currentBook.streamUrl
-    ? `Remove "${currentBook.title}" from your library? It stays on the PC either way -- this just forgets it here.`
+  if (currentBook.streamUrl && !currentBook.offline) return; // no delete action for pure-stream entries; button is hidden
+
+  const msg = currentBook.offline
+    ? `Remove the offline copy of "${currentBook.title}"? It stays on the PC and keeps streaming -- this only frees the space on this device.`
     : `Unravel "${currentBook.title}"? This removes it and all its audio from this device.`;
   if (!confirm(msg)) return;
-  if (currentBook.streamUrl) {
-    await clearStreamBuffer(currentBook.streamUrl);
-  } else {
-    const blobIds = Array.from(new Set(currentBook.chapters.map((c) => c.blobId))).filter(Boolean);
-    for (const id of blobIds) {
-      await idbDeleteBlobChunked(id);
-    }
-  }
+
+  if (currentBook.streamUrl) await clearStreamBuffer(currentBook.streamUrl);
+  const blobIds = Array.from(new Set(currentBook.chapters.map((c) => c.blobId))).filter(Boolean);
+  for (const id of blobIds) await idbDeleteBlobChunked(id);
+
   await idbDelete('books', currentBook.id);
   audioEl.pause();
   audioEl.removeAttribute('src');
@@ -1167,7 +1518,7 @@ async function deleteCurrentBook() {
   loadedBlobId = null;
   currentBook = null;
   showView('library');
-  await refreshLibrary();
+  await renderLibrary();
   await refreshStorageBar();
 }
 
@@ -1180,6 +1531,25 @@ function updateScrub() {
   $('scrub').value = String((rel / ch.duration) * 1000);
   $('time-current').textContent = fmtTime(rel);
   $('time-remaining').textContent = '-' + fmtTime(ch.duration - rel);
+}
+
+// ---------- mini player dock ----------
+function updateMiniPlayer() {
+  const dock = $('mini-player');
+  if (!currentBook || viewPlayer.classList.contains('active')) { dock.classList.add('hidden'); return; }
+  dock.classList.remove('hidden');
+  $('mini-title').textContent = currentBook.title;
+  const ch = curChapter();
+  $('mini-sub').textContent = ch ? ch.name : '';
+  const ajah = ajahFor(currentBook.title || currentBook.id);
+  const cover = $('mini-cover');
+  cover.textContent = (currentBook.title || '?')[0].toUpperCase();
+  cover.style.background = ajah.color;
+  $('btn-mini-playpause').innerHTML = audioEl.paused ? '&#9654;' : '&#10074;&#10074;';
+  const totalDur = currentBook.chapters.reduce((s, c) => s + (c.duration || 0), 0);
+  const elapsed = currentBook.chapters.slice(0, currentBook.currentChapterIndex).reduce((s, c) => s + (c.duration || 0), 0) + chapterElapsed();
+  const pct = totalDur > 0 ? Math.min(100, (elapsed / totalDur) * 100) : 0;
+  $('mini-progress-fill').style.width = pct + '%';
 }
 
 // ---------- sleep timer ----------
@@ -1256,15 +1626,15 @@ function wireEvents() {
     audioEl.pause();
     saveProgress();
     showView('library');
-    refreshLibrary();
+    renderLibrary();
     refreshStorageBar();
   });
   $('btn-delete-book').addEventListener('click', deleteCurrentBook);
-
-  $('tab-library').addEventListener('click', () => { showView('library'); refreshLibrary(); refreshStorageBar(); });
-  $('tab-computer').addEventListener('click', () => showView('computer'));
+  $('btn-keep-offline').addEventListener('click', keepOffline);
 
   $('btn-playpause').addEventListener('click', togglePlayPause);
+  $('btn-mini-playpause').addEventListener('click', (e) => { e.stopPropagation(); togglePlayPause(); });
+  $('mini-player').addEventListener('click', () => { if (currentBook) showView('player'); });
   $('btn-back-15').addEventListener('click', () => skipSeconds(-15));
   $('btn-fwd-30').addEventListener('click', () => skipSeconds(30));
   $('btn-next-chapter').addEventListener('click', nextChapter);
@@ -1273,7 +1643,7 @@ function wireEvents() {
   $('speed-select').addEventListener('change', (e) => {
     const speed = parseFloat(e.target.value);
     audioEl.playbackRate = speed;
-    if (currentBook) { currentBook.speed = speed; idbPut('books', currentBook); }
+    if (currentBook) { currentBook.speed = speed; persistBookState(); }
   });
 
   $('sleep-select').addEventListener('change', (e) => setSleepTimer(e.target.value));
@@ -1296,9 +1666,20 @@ function wireEvents() {
     scrubbing = false;
   });
 
-  audioEl.addEventListener('timeupdate', () => { checkChapterBoundary(); updateScrub(); maintainStreamBuffer(false); });
-  audioEl.addEventListener('play', () => { updatePlayPauseIcon(); if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing'; maintainStreamBuffer(false); });
-  audioEl.addEventListener('pause', () => { updatePlayPauseIcon(); saveProgress(); if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused'; });
+  audioEl.addEventListener('timeupdate', () => { checkChapterBoundary(); updateScrub(); updateMiniPlayer(); maintainStreamBuffer(false); });
+  audioEl.addEventListener('play', () => {
+    updatePlayPauseIcon();
+    updateMiniPlayer();
+    resumeAudioGraphIfNeeded();
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+    maintainStreamBuffer(false);
+  });
+  audioEl.addEventListener('pause', () => {
+    updatePlayPauseIcon();
+    updateMiniPlayer();
+    saveProgress();
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+  });
   audioEl.addEventListener('ended', () => {
     if (sleepTimer.mode === 'eoc') {
       clearSleepTimer();
@@ -1315,4 +1696,31 @@ function wireEvents() {
 
   document.addEventListener('visibilitychange', () => { if (document.hidden) saveProgress(); });
   window.addEventListener('beforeunload', () => saveProgress());
+
+  // ---------- search / filter / shelve ----------
+  $('btn-search-toggle').addEventListener('click', () => $('search-bar').classList.toggle('hidden'));
+  $('search-input').addEventListener('input', (e) => { searchQuery = e.target.value; renderLibrary(); });
+  document.querySelectorAll('.chip[data-filter]').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      document.querySelectorAll('.chip[data-filter]').forEach((c) => c.classList.remove('active'));
+      chip.classList.add('active');
+      activeFilter = chip.dataset.filter;
+      renderLibrary();
+    });
+  });
+  const shelveChip = document.querySelector('.chip[data-shelve]');
+  if (shelveChip) {
+    shelveChip.addEventListener('click', () => {
+      shelveMode = !shelveMode;
+      shelveChip.classList.toggle('active', shelveMode);
+      renderLibrary();
+    });
+  }
+
+  // ---------- settings sheet ----------
+  $('btn-settings').addEventListener('click', () => $('modal-settings').classList.remove('hidden'));
+  $('btn-close-settings').addEventListener('click', () => $('modal-settings').classList.add('hidden'));
+  const bufferSelect = $('buffer-window-select');
+  bufferSelect.value = String(STREAM_BUFFER_AHEAD_SECONDS / 60);
+  bufferSelect.addEventListener('change', (e) => setBufferMinutes(Number(e.target.value)));
 }

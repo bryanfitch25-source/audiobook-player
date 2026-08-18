@@ -1,25 +1,121 @@
-/* The "My Computer" tab: talks to the PC-side library server over the
- * Cloudflare tunnel, lists what's stored there, and plays a book straight
- * off the server -- no download, no on-device copy. A lightweight library
- * record (title/author/chapters/streamUrl) is saved so resume position and
- * progress persist the same way a fully local book's does, but the actual
- * audio bytes are never written to this device; the <audio> element just
- * points at the PC's URL and the browser's own HTTP client handles Range
- * requests for seeking. This replaced an earlier download-into-IndexedDB
- * design that reliably crashed on large (500MB+) real audiobooks -- writing
- * a file that size into IndexedDB in chunks got slower per-chunk as the
- * write went on and eventually took the tab down before finishing, a
- * WebKit-side limitation no amount of chunk/batch tuning fully fixed.
- * Streaming sidesteps the problem: no giant on-device write ever happens. */
+/* PC link: talks to the PC-side library server over the Cloudflare tunnel.
+ * Owns the connection itself, the live PC catalog, pushing playback progress
+ * back to the server for cross-device resume, and the live "importing"
+ * status feed -- app.js's unified catalog renders on top of what this module
+ * exposes rather than keeping its own separate "My Computer" screen. */
 
-const ComputerTab = (() => {
+const PCLink = (() => {
   const STORAGE_KEY = 'pc-server-url';
   let baseUrl = null;
-  let inFlight = new Set(); // book ids currently downloading, to guard double-taps
+  let catalog = []; // last-fetched PC book list, each with server-side `progress`
+  let currentImport = null; // { title, status, percent, label } | null
+  let importSource = null; // EventSource
+  const listeners = new Set(); // called whenever catalog/currentImport changes
 
-  // checkpoint / readDiagLog / clearDiagLogMarker / lastCrashedCheckpoint now
-  // live in app.js as globals, shared with the local file-picker import path
-  // so a crash in either one shows up in the same log.
+  function onChange(fn) { listeners.add(fn); }
+  function notify() { for (const fn of listeners) fn(); }
+
+  function isConnected() { return !!baseUrl; }
+  function getBaseUrl() { return baseUrl; }
+  function getCatalog() { return catalog; }
+  function getCurrentImport() { return currentImport; }
+
+  function loadUrl() {
+    return localStorage.getItem(STORAGE_KEY) || null;
+  }
+
+  function normalizeUrl(raw) {
+    let u = raw.trim();
+    if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+    if (!u.endsWith('/')) u += '/';
+    return u;
+  }
+
+  async function testConnection(url) {
+    const res = await fetch(url + 'api/status', { cache: 'no-store' });
+    if (!res.ok) throw new Error('Server responded with ' + res.status);
+    const data = await res.json();
+    if (!data || data.ok !== true) throw new Error('Unexpected response from server');
+  }
+
+  async function connect(rawUrl) {
+    const url = normalizeUrl(rawUrl);
+    await testConnection(url);
+    localStorage.setItem(STORAGE_KEY, url);
+    baseUrl = url;
+    startImportFeed();
+    await refreshCatalog();
+  }
+
+  function forget() {
+    localStorage.removeItem(STORAGE_KEY);
+    baseUrl = null;
+    catalog = [];
+    stopImportFeed();
+    notify();
+  }
+
+  async function refreshCatalog() {
+    if (!baseUrl) return;
+    try {
+      const res = await fetch(baseUrl + 'api/books', { cache: 'no-store' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      catalog = await res.json();
+    } catch (e) {
+      catalog = [];
+    }
+    notify();
+  }
+
+  function streamUrlFor(serverId) {
+    return baseUrl + 'api/books/' + encodeURIComponent(serverId) + '/file';
+  }
+
+  /* Fire-and-forget by design: a progress push that fails (signal drop mid-
+   * listen) shouldn't interrupt playback or retry-storm the server. The next
+   * periodic push a few seconds later covers for it. */
+  async function pushProgress(serverId, currentTime, currentChapterIndex) {
+    if (!baseUrl) return;
+    try {
+      await fetch(baseUrl + 'api/books/' + encodeURIComponent(serverId) + '/progress', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentTime, currentChapterIndex }),
+      });
+    } catch (e) {}
+  }
+
+  async function deleteFromServer(serverId) {
+    if (!baseUrl) return;
+    await fetch(baseUrl + 'api/books/' + encodeURIComponent(serverId), { method: 'DELETE' });
+    await refreshCatalog();
+  }
+
+  function startImportFeed() {
+    stopImportFeed();
+    if (!baseUrl || typeof EventSource === 'undefined') return;
+    try {
+      importSource = new EventSource(baseUrl + 'api/imports/current');
+      importSource.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          const wasActive = !!currentImport;
+          currentImport = data && data.status ? data : null;
+          notify();
+          // A finished/errored import clears itself server-side a few seconds
+          // later -- that's also the moment the new book is actually ready,
+          // so refresh the catalog once rather than polling for it.
+          if (wasActive && !currentImport) refreshCatalog();
+        } catch (err) {}
+      };
+      importSource.onerror = () => {}; // EventSource auto-reconnects; nothing to do
+    } catch (e) {}
+  }
+
+  function stopImportFeed() {
+    if (importSource) { importSource.close(); importSource = null; }
+    currentImport = null;
+  }
 
   /* This used to trigger a file download via a[download].click(). That
    * mechanism has real, documented gesture-timing requirements on iOS
@@ -51,7 +147,7 @@ const ComputerTab = (() => {
 
     lines.push('');
     lines.push(`--- Step log (${log.length} entries) ---`);
-    if (!log.length) lines.push('(empty -- no download has been attempted since this was added)');
+    if (!log.length) lines.push('(empty -- no import or download has been attempted since this was added)');
     let prevAt = null;
     for (const entry of log) {
       const t = new Date(entry.at).toISOString();
@@ -63,30 +159,7 @@ const ComputerTab = (() => {
     return lines.join('\n');
   }
 
-  function loadUrl() {
-    const stored = localStorage.getItem(STORAGE_KEY);
-    return stored || null;
-  }
-
-  function normalizeUrl(raw) {
-    let u = raw.trim();
-    if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
-    if (!u.endsWith('/')) u += '/';
-    return u;
-  }
-
   function el(id) { return document.getElementById(id); }
-
-  async function onShow() {
-    await showCrashReportIfAny();
-    baseUrl = loadUrl();
-    if (!baseUrl) {
-      showConnectPanel(false);
-    } else {
-      showContent();
-      await refreshList();
-    }
-  }
 
   async function showCrashReportIfAny() {
     const crashed = await lastCrashedCheckpoint();
@@ -98,168 +171,48 @@ const ComputerTab = (() => {
     box.classList.remove('hidden');
   }
 
-  function showConnectPanel(cancelable) {
-    el('computer-connect').classList.remove('hidden');
-    el('computer-content').classList.add('hidden');
-    el('computer-url-input').value = baseUrl || '';
-    el('btn-computer-cancel').classList.toggle('hidden', !cancelable);
-    el('computer-connect-error').classList.add('hidden');
-  }
-
-  function showContent() {
-    el('computer-connect').classList.add('hidden');
-    el('computer-content').classList.remove('hidden');
-  }
-
-  async function testConnection(url) {
-    const res = await fetch(url + 'api/status', { cache: 'no-store' });
-    if (!res.ok) throw new Error('Server responded with ' + res.status);
-    const data = await res.json();
-    if (!data || data.ok !== true) throw new Error('Unexpected response from server');
-  }
-
-  async function saveConnection() {
-    const raw = el('computer-url-input').value;
-    if (!raw.trim()) return;
-    const url = normalizeUrl(raw);
+  function wireSettingsPanel() {
+    const urlInput = el('computer-url-input');
     const errEl = el('computer-connect-error');
-    errEl.classList.add('hidden');
-    const btn = el('btn-computer-save');
-    btn.disabled = true;
-    btn.textContent = 'Connecting...';
-    try {
-      await testConnection(url);
-      localStorage.setItem(STORAGE_KEY, url);
-      baseUrl = url;
-      showContent();
-      await refreshList();
-    } catch (e) {
-      errEl.textContent = "Couldn't reach that address. Check it was copied in full and your PC is on.";
-      errEl.classList.remove('hidden');
-    } finally {
-      btn.disabled = false;
-      btn.textContent = 'Connect';
+    const connectedAs = el('computer-connected-as');
+    const forgetBtn = el('btn-computer-forget');
+    const saveBtn = el('btn-computer-save');
+
+    function refreshConnectUi() {
+      urlInput.value = baseUrl || '';
+      forgetBtn.classList.toggle('hidden', !baseUrl);
+      if (baseUrl) {
+        connectedAs.textContent = 'Connected to ' + baseUrl.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+        connectedAs.classList.remove('hidden');
+      } else {
+        connectedAs.classList.add('hidden');
+      }
     }
-  }
+    onChange(refreshConnectUi);
+    refreshConnectUi();
 
-  function fmtBytesLocal(n) {
-    if (n < 1024) return n + ' B';
-    const u = ['KB', 'MB', 'GB'];
-    let i = -1;
-    do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
-    return n.toFixed(1) + ' ' + u[i];
-  }
+    saveBtn.addEventListener('click', async () => {
+      const raw = urlInput.value;
+      if (!raw.trim()) return;
+      errEl.classList.add('hidden');
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Connecting...';
+      try {
+        await connect(raw);
+      } catch (e) {
+        errEl.textContent = "Couldn't reach that address. Check it was copied in full and your PC is on.";
+        errEl.classList.remove('hidden');
+      } finally {
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Connect';
+      }
+    });
 
-  async function localBookByServerId(serverId) {
-    const all = await idbGetAll('books');
-    return all.find((b) => b.sourceServerId === serverId && b.sourceServerUrl === baseUrl) || null;
-  }
+    forgetBtn.addEventListener('click', () => {
+      if (!confirm('Forget this PC? Streamed books stay on the PC, but you\'ll need to reconnect to see them here.')) return;
+      forget();
+    });
 
-  async function refreshList() {
-    const statusEl = el('computer-status');
-    const listEl = el('computer-list');
-    const emptyEl = el('computer-empty');
-    statusEl.textContent = 'Reading the PC library...';
-    statusEl.classList.remove('hidden');
-    listEl.innerHTML = '';
-
-    let books;
-    try {
-      const res = await fetch(baseUrl + 'api/books', { cache: 'no-store' });
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      books = await res.json();
-    } catch (e) {
-      statusEl.textContent = "Couldn't reach the PC. Check it's on and connected.";
-      return;
-    }
-
-    statusEl.classList.add('hidden');
-    emptyEl.classList.toggle('hidden', books.length > 0);
-
-    for (const book of books) {
-      const local = await localBookByServerId(book.id);
-      listEl.appendChild(renderRow(book, local));
-    }
-  }
-
-  function renderRow(book, local) {
-    const li = document.createElement('li');
-    li.className = 'book-row';
-    const ajah = typeof ajahFor === 'function' ? ajahFor(book.title || book.id) : { color: '#c9a34e' };
-    li.style.setProperty('--ajah', ajah.color);
-
-    const sub = `${escapeHtml(book.author || '')} ${book.author ? '&middot;' : ''} ${fmtTime(book.duration)} &middot; ${fmtBytesLocal(book.sizeBytes)}`;
-    const badge = book.seriesNumber ? `<div class="series-badge">${escapeHtml(String(book.seriesNumber))}</div>` : '';
-
-    li.innerHTML = `
-      <div class="book-cover" style="background:linear-gradient(150deg, ${ajah.color}, rgba(0,0,0,0.75))">${badge}${escapeHtml((book.title || '?')[0].toUpperCase())}</div>
-      <div class="book-meta">
-        <div class="book-title">${escapeHtml(book.title)}</div>
-        <div class="book-author">${sub}</div>
-      </div>
-    `;
-
-    const action = document.createElement('div');
-    const btn = document.createElement('button');
-    btn.className = 'btn-download';
-    btn.textContent = 'Play';
-    btn.addEventListener('click', () => openRemoteBook(book, local, btn));
-    action.appendChild(btn);
-    li.appendChild(action);
-    return li;
-  }
-
-  /* Tapping a PC book either opens it straight away (if it's already in the
-   * library from a previous tap) or first writes the small metadata record
-   * that lets it appear there, then opens it. Either way nothing but text
-   * (title/author/chapter list/URL) ever touches this device's storage. */
-  async function openRemoteBook(book, local, btn) {
-    if (inFlight.has(book.id)) return;
-    inFlight.add(book.id);
-    btn.disabled = true;
-    try {
-      const bookId = local ? local.id : await createRemoteBookRecord(book);
-      await openPlayer(bookId);
-      clearDiagLogMarker();
-    } catch (e) {
-      await checkpoint('caught error opening remote book: ' + (e && e.message ? e.message : String(e)));
-      alert('Could not open this book: ' + (e && e.message ? e.message : String(e)));
-    } finally {
-      btn.disabled = false;
-      inFlight.delete(book.id);
-    }
-  }
-
-  async function createRemoteBookRecord(book) {
-    const streamUrl = baseUrl + 'api/books/' + encodeURIComponent(book.id) + '/file';
-    const bookId = uid();
-    const record = {
-      id: bookId,
-      title: book.title,
-      author: book.author || '',
-      seriesNumber: book.seriesNumber || null,
-      streamUrl,
-      sizeBytes: book.sizeBytes || 0,
-      chapters: (book.chapters && book.chapters.length)
-        ? book.chapters.map((c) => ({ name: c.name, start: c.start, duration: c.duration }))
-        : [{ name: book.title, start: 0, duration: book.duration || 0 }],
-      currentChapterIndex: 0,
-      currentTime: 0,
-      speed: 1,
-      addedDate: Date.now(),
-      lastPlayed: Date.now(),
-      sourceServerId: book.id,
-      sourceServerUrl: baseUrl,
-    };
-    await idbPut('books', record);
-    return bookId;
-  }
-
-  function wire() {
-    el('btn-computer-save').addEventListener('click', saveConnection);
-    el('btn-computer-settings').addEventListener('click', () => showConnectPanel(!!baseUrl));
-    el('btn-computer-cancel').addEventListener('click', () => showContent());
-    el('computer-url-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') saveConnection(); });
     const exportBtn = el('btn-computer-export-log');
     const exportBox = el('computer-log-box');
     const copyBtn = el('btn-computer-copy-log');
@@ -296,9 +249,6 @@ const ComputerTab = (() => {
         const failed = () => { copyBtn.textContent = 'Select text manually'; setTimeout(() => { copyBtn.textContent = 'Copy'; }, 2000); };
         if (navigator.clipboard && navigator.clipboard.writeText) {
           navigator.clipboard.writeText(text).then(done).catch(() => {
-            // Fallback for contexts where the async Clipboard API is blocked --
-            // the legacy synchronous copy command via a selected range still
-            // works as a direct result of this same tap.
             try {
               const range = document.createRange();
               range.selectNodeContents(exportBox);
@@ -317,9 +267,23 @@ const ComputerTab = (() => {
     }
   }
 
-  document.addEventListener('DOMContentLoaded', wire);
+  async function init() {
+    baseUrl = loadUrl();
+    if (baseUrl) {
+      startImportFeed();
+      await refreshCatalog();
+    }
+    await showCrashReportIfAny();
+    wireSettingsPanel();
+  }
 
-  return { onShow };
+  document.addEventListener('DOMContentLoaded', init);
+
+  return {
+    isConnected, getBaseUrl, getCatalog, getCurrentImport,
+    refreshCatalog, streamUrlFor, pushProgress, deleteFromServer,
+    onChange,
+  };
 })();
 
-window.ComputerTab = ComputerTab;
+window.PCLink = PCLink;

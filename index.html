@@ -36,17 +36,33 @@
 
 <div id="app">
 
-  <!-- LIBRARY -->
+  <!-- LIBRARY (unified catalog: PC books + on-device books) -->
   <section id="view-library" class="view active">
     <header class="topbar">
       <div class="brand">
         <h1>The Pattern</h1>
         <p class="brand-sub">A Turning of the Wheel</p>
       </div>
-      <button id="btn-add" class="wheel-btn" title="Weave a new thread" aria-label="Weave a new thread">
-        <svg class="wheel-ico"><use href="#wheel"/></svg>
-      </button>
+      <div class="topbar-actions">
+        <button id="btn-search-toggle" class="icon-btn" aria-label="Search the Pattern">&#128269;</button>
+        <button id="btn-settings" class="icon-btn" aria-label="Settings">&#9881;</button>
+        <button id="btn-add" class="wheel-btn" title="Weave a new thread" aria-label="Weave a new thread">
+          <svg class="wheel-ico"><use href="#wheel"/></svg>
+        </button>
+      </div>
     </header>
+
+    <div id="conn-status" class="conn-status hidden"></div>
+
+    <div id="search-bar" class="search-bar hidden">
+      <input id="search-input" type="text" placeholder="Search title or teller&hellip;" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <div class="filter-chips">
+        <button class="chip active" data-filter="all">All</button>
+        <button class="chip" data-filter="unfinished">Unfinished</button>
+        <button class="chip" data-filter="newest">Newest</button>
+        <button class="chip" data-shelve="1">Shelve by teller</button>
+      </div>
+    </div>
 
     <div id="storage-bar" class="storage-bar hidden">
       <div class="storage-track"><div id="storage-fill" class="storage-fill"></div></div>
@@ -55,64 +71,14 @@
 
     <div id="library-empty" class="empty-state hidden">
       <svg class="empty-wheel"><use href="#wheel"/></svg>
-      <p>The Pattern holds no threads yet.</p>
-      <p class="muted">Touch the Wheel above to bind a book into it. Everything you add is kept here on this device alone.</p>
+      <p id="library-empty-text">The Pattern holds no threads yet.</p>
+      <p class="muted" id="library-empty-sub">Touch the Wheel above to bind a book, or connect to your PC in Settings.</p>
     </div>
 
-    <ul id="library-list" class="library-list"></ul>
+    <div id="library-list" class="library-list"></div>
     <p class="tagline">The Wheel weaves as the Wheel wills.</p>
     <p id="app-version" class="app-version"></p>
   </section>
-
-  <!-- MY COMPUTER -->
-  <section id="view-computer" class="view">
-    <header class="topbar">
-      <div class="brand">
-        <h1>My Computer</h1>
-        <p class="brand-sub">A Bridge Across the World</p>
-      </div>
-      <button id="btn-computer-settings" class="icon-btn" aria-label="Change server address">&#9881;</button>
-    </header>
-
-    <div id="computer-connect" class="connect-panel hidden">
-      <p>Paste the address shown on your PC's library page.</p>
-      <p class="muted">Open the desktop page, copy the link under "Connect your phone," and paste it here once.</p>
-      <input id="computer-url-input" type="text" placeholder="https://your-address/token/" autocapitalize="off" autocorrect="off" spellcheck="false">
-      <div class="modal-actions">
-        <button id="btn-computer-cancel" class="btn secondary hidden">Cancel</button>
-        <button id="btn-computer-save" class="btn primary">Connect</button>
-      </div>
-      <p id="computer-connect-error" class="connect-error hidden"></p>
-    </div>
-
-    <div id="computer-content" class="hidden">
-      <p id="computer-crash-report" class="crash-report hidden"></p>
-      <p class="dl-hint">Books here play straight from your PC over the network -- nothing is saved to this device, so a signal is needed each time you listen.</p>
-      <div class="log-btn-row">
-        <button id="btn-computer-export-log" class="btn secondary export-log-btn">Show Diagnostic Log</button>
-        <button id="btn-computer-copy-log" class="btn secondary copy-log-btn hidden">Copy</button>
-      </div>
-      <pre id="computer-log-box" class="log-box hidden"></pre>
-      <div id="computer-status" class="probe-status hidden"></div>
-      <div id="computer-empty" class="empty-state hidden">
-        <p>No books on the PC library yet.</p>
-        <p class="muted">Drag files into the desktop page to add some.</p>
-      </div>
-      <ul id="computer-list" class="library-list"></ul>
-    </div>
-  </section>
-
-  <!-- TAB BAR -->
-  <nav id="tabbar" class="tabbar">
-    <button id="tab-library" class="tab-btn active" aria-label="Library">
-      <svg class="tab-ico"><use href="#wheel"/></svg>
-      <span>Library</span>
-    </button>
-    <button id="tab-computer" class="tab-btn" aria-label="My Computer">
-      <span class="tab-ico tab-ico-text">&#128421;</span>
-      <span>My Computer</span>
-    </button>
-  </nav>
 
   <!-- PLAYER -->
   <section id="view-player" class="view">
@@ -127,6 +93,8 @@
         <svg class="cover-wheel"><use href="#wheel"/></svg>
         <span id="cover-initial">A</span>
       </div>
+
+      <div id="player-conn-status" class="conn-status inline hidden"></div>
 
       <div class="chapter-name" id="chapter-name">Chapter 1</div>
 
@@ -173,10 +141,23 @@
       </div>
       <div id="sleep-status" class="sleep-status hidden"></div>
 
+      <button id="btn-keep-offline" class="btn secondary keep-offline-btn hidden">Keep this book offline</button>
+
       <h2 class="section-label">Chapters</h2>
       <ul id="chapter-list" class="chapter-list"></ul>
     </div>
   </section>
+
+  <!-- MINI PLAYER DOCK -->
+  <div id="mini-player" class="mini-player hidden">
+    <div class="mini-progress"><div id="mini-progress-fill" class="mini-progress-fill"></div></div>
+    <div class="mini-cover" id="mini-cover">A</div>
+    <div class="mini-meta">
+      <div id="mini-title" class="mini-title">Title</div>
+      <div id="mini-sub" class="mini-sub">Chapter 1</div>
+    </div>
+    <button id="btn-mini-playpause" class="mini-btn" aria-label="Play or pause">&#9654;</button>
+  </div>
 
   <!-- ADD BOOK -->
   <div id="modal-add" class="modal hidden">
@@ -198,6 +179,48 @@
       <div class="modal-actions">
         <button id="btn-cancel-add" class="btn secondary">Cancel</button>
         <button id="btn-confirm-add" class="btn primary" disabled>Bind</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SETTINGS SHEET -->
+  <div id="modal-settings" class="modal hidden">
+    <div class="modal-card">
+      <h2>Settings</h2>
+
+      <h3 class="settings-h">My Computer</h3>
+      <div id="settings-connect" class="connect-panel">
+        <p class="muted">Paste the address shown on your PC's library page to stream your PC library here.</p>
+        <input id="computer-url-input" type="text" placeholder="https://your-address/token/" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <div class="modal-actions">
+          <button id="btn-computer-forget" class="btn secondary hidden">Forget this PC</button>
+          <button id="btn-computer-save" class="btn primary">Connect</button>
+        </div>
+        <p id="computer-connect-error" class="connect-error hidden"></p>
+        <p id="computer-connected-as" class="connected-as hidden"></p>
+      </div>
+
+      <h3 class="settings-h">Streaming buffer</h3>
+      <p class="muted">How far ahead to keep audio ready, in case your signal drops.</p>
+      <div class="field-box">
+        <label for="buffer-window-select">Buffer ahead</label>
+        <select id="buffer-window-select">
+          <option value="10">10 minutes</option>
+          <option value="30" selected>30 minutes</option>
+          <option value="60">60 minutes</option>
+        </select>
+      </div>
+
+      <h3 class="settings-h">Diagnostics</h3>
+      <p id="computer-crash-report" class="crash-report hidden"></p>
+      <div class="log-btn-row">
+        <button id="btn-computer-export-log" class="btn secondary export-log-btn">Show Diagnostic Log</button>
+        <button id="btn-computer-copy-log" class="btn secondary copy-log-btn hidden">Copy</button>
+      </div>
+      <pre id="computer-log-box" class="log-box hidden"></pre>
+
+      <div class="modal-actions">
+        <button id="btn-close-settings" class="btn primary">Done</button>
       </div>
     </div>
   </div>

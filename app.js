@@ -5,7 +5,7 @@
 // Bumped in lockstep with sw.js's CACHE constant. Shown in the UI so there is
 // never any ambiguity, after a service-worker update, about whether the code
 // actually running is the code that was just shipped.
-const APP_VERSION = 'the-pattern-v27'; // must exactly match CACHE in sw.js
+const APP_VERSION = 'the-pattern-v28'; // must exactly match CACHE in sw.js
 
 const DB_NAME = 'audiobook-player';
 const DB_VERSION = 2;
@@ -464,6 +464,8 @@ async function init() {
   connStatusTimer = setInterval(updateConnStatus, 15000);
   window.addEventListener('online', updateConnStatus);
   window.addEventListener('offline', updateConnStatus);
+
+  updateStreakUI();
 }
 
 /* Before idbPutBlobChunked cleaned up after itself on failure, a crashed or
@@ -682,6 +684,21 @@ function renderBookRow(entry, compact) {
     if (entry.kind === 'stream') openPlayerWithBook(book);
     else openPlayer(book.id);
   });
+
+  // Offline copies are the one thing worth freeing up space on without
+  // opening the player first -- a quick remove right on the row.
+  if (entry.kind === 'offline') {
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'row-remove-offline';
+    removeBtn.setAttribute('aria-label', 'Remove offline copy');
+    removeBtn.innerHTML = '&#10005;';
+    removeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      removeOfflineCopy(book);
+    });
+    li.appendChild(removeBtn);
+  }
+
   return li;
 }
 
@@ -742,6 +759,148 @@ async function updatePlayerConnStatus() {
     : `Streaming -- ~${minutesBuffered}m buffered ahead`;
   el.className = 'conn-status inline ' + (offline ? 'warn' : 'ok');
   el.classList.remove('hidden');
+}
+
+// ---------- listening streak ----------
+/* A day counts the moment real playback progress is observed, not just
+ * opening the app -- recorded from the same timeupdate tick everything else
+ * already watches, throttled so it only actually checks once every 30s
+ * rather than on every one of the several-per-second timeupdate events.
+ * Stored in localStorage as a plain sorted array of "YYYY-MM-DD" strings;
+ * a book a day for over a year is still a tiny amount of data. */
+const STREAK_KEY = 'listen-streak-days';
+const STREAK_CAP_DAYS = 730;
+let lastStreakCheck = 0;
+
+const STREAK_MILESTONES = {
+  3: "Three days unbroken. The Wheel takes notice.",
+  7: "A full turning of the week. The Pattern holds firm.",
+  14: "Two weeks woven without a gap in the thread.",
+  30: "A full moon's turning -- thirty days unbroken.",
+  50: "Fifty days. Even the Aes Sedai would call this dedication.",
+  100: "One hundred days. The Wheel weaves as you will.",
+  200: "Two hundred days unbroken -- a ta'veren's thread.",
+  365: "A full Age has turned. Unbroken, one year.",
+};
+
+function dateStr(d) {
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+function todayStr() { return dateStr(new Date()); }
+function dateFromStr(s) {
+  const [y, m, d] = s.split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+function daysBetween(a, b) {
+  return Math.round((dateFromStr(b) - dateFromStr(a)) / 86400000);
+}
+
+function loadStreakDays() {
+  try { return JSON.parse(localStorage.getItem(STREAK_KEY)) || []; } catch (e) { return []; }
+}
+function saveStreakDays(days) {
+  if (days.length > STREAK_CAP_DAYS) days = days.slice(days.length - STREAK_CAP_DAYS);
+  localStorage.setItem(STREAK_KEY, JSON.stringify(days));
+}
+
+function computeStreak(days) {
+  if (!days.length) return { current: 0, longest: 0, total: 0 };
+  const set = new Set(days);
+  const today = new Date();
+  const yesterday = new Date(today); yesterday.setDate(yesterday.getDate() - 1);
+
+  let current = 0;
+  let cursor = set.has(dateStr(today)) ? today : (set.has(dateStr(yesterday)) ? yesterday : null);
+  if (cursor) {
+    cursor = new Date(cursor);
+    while (set.has(dateStr(cursor))) {
+      current++;
+      cursor.setDate(cursor.getDate() - 1);
+    }
+  }
+
+  let longest = 0, run = 0, prev = null;
+  for (const d of days) {
+    run = (prev && daysBetween(prev, d) === 1) ? run + 1 : 1;
+    longest = Math.max(longest, run);
+    prev = d;
+  }
+
+  return { current, longest, total: days.length };
+}
+
+function recordListenActivity() {
+  const today = todayStr();
+  const days = loadStreakDays();
+  if (days.includes(today)) return;
+  days.push(today);
+  days.sort();
+  saveStreakDays(days);
+  updateStreakUI();
+  const milestone = STREAK_MILESTONES[computeStreak(days).current];
+  if (milestone) showStreakToast(milestone);
+}
+
+function maybeRecordListenActivity() {
+  const now = Date.now();
+  if (now - lastStreakCheck < 30000) return;
+  lastStreakCheck = now;
+  recordListenActivity();
+}
+
+function updateStreakUI() {
+  const pill = $('btn-streak');
+  if (!pill) return;
+  const days = loadStreakDays();
+  const { current } = computeStreak(days);
+  pill.classList.toggle('hidden', days.length === 0);
+  pill.classList.toggle('streak-active', current > 0);
+  $('streak-count').textContent = String(current);
+}
+
+function flavorForStreak(n) {
+  const keys = Object.keys(STREAK_MILESTONES).map(Number).sort((a, b) => b - a);
+  for (const k of keys) if (n >= k) return STREAK_MILESTONES[k];
+  return null;
+}
+
+function renderStreakHeatmap(days) {
+  const set = new Set(days);
+  const el = $('streak-heatmap');
+  el.innerHTML = '';
+  const today = new Date();
+  for (let i = 34; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    const cell = document.createElement('div');
+    cell.className = 'heat-cell' + (set.has(dateStr(d)) ? ' active' : '');
+    cell.title = dateStr(d);
+    el.appendChild(cell);
+  }
+}
+
+function openStreakModal() {
+  const days = loadStreakDays();
+  const { current, longest, total } = computeStreak(days);
+  $('streak-current').textContent = current;
+  $('streak-longest').textContent = longest;
+  $('streak-total').textContent = total;
+  $('streak-flavor').textContent = flavorForStreak(current)
+    || (current > 0 ? 'The thread holds. Keep the Wheel turning.' : 'Listen today to begin a new thread.');
+  renderStreakHeatmap(days);
+  $('modal-streak').classList.remove('hidden');
+}
+
+function showStreakToast(text) {
+  const t = document.createElement('div');
+  t.className = 'streak-toast';
+  t.textContent = text;
+  document.body.appendChild(t);
+  requestAnimationFrame(() => t.classList.add('show'));
+  setTimeout(() => {
+    t.classList.remove('show');
+    setTimeout(() => t.remove(), 400);
+  }, 4000);
 }
 
 // ---------- navigation ----------
@@ -1498,26 +1657,45 @@ function saveProgress() {
   persistBookState();
 }
 
+/* Shared by the player's delete button, the player's "keep offline" undo
+ * path, and the quick remove action directly on a library row -- one place
+ * that actually clears the blob chunks and the book record, regardless of
+ * which UI triggered it or whether the book being removed is the one
+ * currently open in the player. */
+async function removeBookRecordFromDevice(book) {
+  if (book.streamUrl) await clearStreamBuffer(book.streamUrl);
+  const blobIds = Array.from(new Set(book.chapters.map((c) => c.blobId))).filter(Boolean);
+  for (const id of blobIds) await idbDeleteBlobChunked(id);
+  await idbDelete('books', book.id);
+
+  if (currentBook && currentBook.id === book.id) {
+    audioEl.pause();
+    audioEl.removeAttribute('src');
+    if (currentBlobUrl) { URL.revokeObjectURL(currentBlobUrl); currentBlobUrl = null; }
+    loadedBlobId = null;
+    currentBook = null;
+    if (viewPlayer.classList.contains('active')) showView('library');
+  }
+}
+
+// Removing an offline copy just goes back to streaming -- the book itself
+// isn't gone, it reappears as a "Streaming" catalog entry on the next render
+// since it's still in the PC's live catalog.
+async function removeOfflineCopy(book) {
+  if (!confirm(`Remove the offline copy of "${book.title}"? It stays on the PC and keeps streaming -- this only frees the space on this device.`)) return;
+  await removeBookRecordFromDevice(book);
+  await renderLibrary();
+  await refreshStorageBar();
+}
+
 async function deleteCurrentBook() {
   if (!currentBook) return;
   if (currentBook.streamUrl && !currentBook.offline) return; // no delete action for pure-stream entries; button is hidden
 
-  const msg = currentBook.offline
-    ? `Remove the offline copy of "${currentBook.title}"? It stays on the PC and keeps streaming -- this only frees the space on this device.`
-    : `Unravel "${currentBook.title}"? This removes it and all its audio from this device.`;
-  if (!confirm(msg)) return;
+  if (currentBook.offline) { await removeOfflineCopy(currentBook); return; }
 
-  if (currentBook.streamUrl) await clearStreamBuffer(currentBook.streamUrl);
-  const blobIds = Array.from(new Set(currentBook.chapters.map((c) => c.blobId))).filter(Boolean);
-  for (const id of blobIds) await idbDeleteBlobChunked(id);
-
-  await idbDelete('books', currentBook.id);
-  audioEl.pause();
-  audioEl.removeAttribute('src');
-  if (currentBlobUrl) { URL.revokeObjectURL(currentBlobUrl); currentBlobUrl = null; }
-  loadedBlobId = null;
-  currentBook = null;
-  showView('library');
+  if (!confirm(`Unravel "${currentBook.title}"? This removes it and all its audio from this device.`)) return;
+  await removeBookRecordFromDevice(currentBook);
   await renderLibrary();
   await refreshStorageBar();
 }
@@ -1666,7 +1844,7 @@ function wireEvents() {
     scrubbing = false;
   });
 
-  audioEl.addEventListener('timeupdate', () => { checkChapterBoundary(); updateScrub(); updateMiniPlayer(); maintainStreamBuffer(false); });
+  audioEl.addEventListener('timeupdate', () => { checkChapterBoundary(); updateScrub(); updateMiniPlayer(); maintainStreamBuffer(false); maybeRecordListenActivity(); });
   audioEl.addEventListener('play', () => {
     updatePlayPauseIcon();
     updateMiniPlayer();
@@ -1723,4 +1901,8 @@ function wireEvents() {
   const bufferSelect = $('buffer-window-select');
   bufferSelect.value = String(STREAM_BUFFER_AHEAD_SECONDS / 60);
   bufferSelect.addEventListener('change', (e) => setBufferMinutes(Number(e.target.value)));
+
+  // ---------- listening streak ----------
+  $('btn-streak').addEventListener('click', openStreakModal);
+  $('btn-close-streak').addEventListener('click', () => $('modal-streak').classList.add('hidden'));
 }

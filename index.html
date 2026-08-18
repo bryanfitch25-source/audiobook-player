@@ -44,6 +44,10 @@
         <p class="brand-sub">A Turning of the Wheel</p>
       </div>
       <div class="topbar-actions">
+        <button id="btn-streak" class="streak-pill hidden" aria-label="Listening streak">
+          <svg class="streak-ico"><use href="#wheel"/></svg>
+          <span id="streak-count">0</span>
+        </button>
         <button id="btn-search-toggle" class="icon-btn" aria-label="Search the Pattern">&#128269;</button>
         <button id="btn-settings" class="icon-btn" aria-label="Settings">&#9881;</button>
         <button id="btn-add" class="wheel-btn" title="Weave a new thread" aria-label="Weave a new thread">
@@ -221,6 +225,23 @@
 
       <div class="modal-actions">
         <button id="btn-close-settings" class="btn primary">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- LISTENING STREAK -->
+  <div id="modal-streak" class="modal hidden">
+    <div class="modal-card">
+      <h2>Threads Unbroken</h2>
+      <div class="streak-stats">
+        <div class="streak-stat"><span id="streak-current" class="streak-num">0</span><span class="streak-label">Day streak</span></div>
+        <div class="streak-stat"><span id="streak-longest" class="streak-num">0</span><span class="streak-label">Longest</span></div>
+        <div class="streak-stat"><span id="streak-total" class="streak-num">0</span><span class="streak-label">Days woven</span></div>
+      </div>
+      <p id="streak-flavor" class="streak-flavor"></p>
+      <div id="streak-heatmap" class="streak-heatmap"></div>
+      <div class="modal-actions">
+        <button id="btn-close-streak" class="btn primary">Done</button>
       </div>
     </div>
   </div>

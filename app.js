@@ -5,7 +5,7 @@
 // Bumped in lockstep with sw.js's CACHE constant. Shown in the UI so there is
 // never any ambiguity, after a service-worker update, about whether the code
 // actually running is the code that was just shipped.
-const APP_VERSION = 'the-pattern-v29'; // must exactly match CACHE in sw.js
+const APP_VERSION = 'the-pattern-v30'; // must exactly match CACHE in sw.js
 
 const DB_NAME = 'audiobook-player';
 const DB_VERSION = 2;
@@ -1555,7 +1555,7 @@ function checkChapterBoundary() {
   if (currentBook.chapters[next].blobId !== ch.blobId) return; // `ended` handles it
 
   if (sleepTimer.mode === 'eoc') {
-    audioEl.pause();
+    pauseAudio();
     clearSleepTimer();
     saveProgress();
     return;
@@ -1572,9 +1572,35 @@ function updatePlayPauseIcon() {
   $('btn-mini-playpause').innerHTML = icon;
 }
 
+/* A phone call, Siri, an alarm, or another app grabbing audio focus all pause
+ * this element the same way -- the browser just calls pause() on it, with no
+ * event that distinguishes "the OS took audio focus away" from "the user
+ * tapped pause". The only way to tell them apart is to mark our own
+ * deliberate pauses right before making them; anything else that arrives as
+ * a `pause` event is an interruption, and worth trying to resume from once
+ * it clears, the way a real audiobook app would. */
+let intentionalPause = false;
+let pausedByInterruption = false;
+let resumeAttempts = 0;
+
+function pauseAudio() {
+  intentionalPause = true;
+  pausedByInterruption = false;
+  audioEl.pause();
+}
+
+function scheduleResumeAttempt() {
+  if (!pausedByInterruption || resumeAttempts >= 6) return;
+  resumeAttempts++;
+  setTimeout(() => {
+    if (!pausedByInterruption || !audioEl.paused) return;
+    audioEl.play().catch(() => scheduleResumeAttempt());
+  }, Math.min(resumeAttempts * 1500, 8000));
+}
+
 function togglePlayPause() {
   if (audioEl.paused) audioEl.play().catch(() => {});
-  else audioEl.pause();
+  else pauseAudio();
 }
 
 function skipSeconds(delta) {
@@ -1634,7 +1660,7 @@ async function removeBookRecordFromDevice(book) {
   await idbDelete('books', book.id);
 
   if (currentBook && currentBook.id === book.id) {
-    audioEl.pause();
+    pauseAudio();
     audioEl.removeAttribute('src');
     if (currentBlobUrl) { URL.revokeObjectURL(currentBlobUrl); currentBlobUrl = null; }
     loadedBlobId = null;
@@ -1720,7 +1746,7 @@ function setSleepTimer(value) {
   const tick = () => {
     const remaining = Math.max(0, sleepTimer.deadline - Date.now());
     if (remaining <= 0) {
-      audioEl.pause();
+      pauseAudio();
       clearInterval(sleepTimer.intervalId);
       clearSleepTimer();
       return;
@@ -1742,7 +1768,7 @@ function updateMediaSessionMetadata() {
     album: currentBook.title,
   });
   navigator.mediaSession.setActionHandler('play', () => audioEl.play().catch(() => {}));
-  navigator.mediaSession.setActionHandler('pause', () => audioEl.pause());
+  navigator.mediaSession.setActionHandler('pause', () => pauseAudio());
   navigator.mediaSession.setActionHandler('seekbackward', () => skipSeconds(-15));
   navigator.mediaSession.setActionHandler('seekforward', () => skipSeconds(30));
   navigator.mediaSession.setActionHandler('previoustrack', () => prevChapter());
@@ -1766,7 +1792,7 @@ function wireEvents() {
   });
 
   $('btn-back').addEventListener('click', () => {
-    audioEl.pause();
+    pauseAudio();
     saveProgress();
     showView('library');
     renderLibrary();
@@ -1813,6 +1839,7 @@ function wireEvents() {
   audioEl.addEventListener('play', () => {
     updatePlayPauseIcon();
     updateMiniPlayer();
+    pausedByInterruption = false;
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
     maintainStreamBuffer(false);
   });
@@ -1821,6 +1848,12 @@ function wireEvents() {
     updateMiniPlayer();
     saveProgress();
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+    if (!intentionalPause) {
+      pausedByInterruption = true;
+      resumeAttempts = 0;
+      scheduleResumeAttempt();
+    }
+    intentionalPause = false;
   });
   audioEl.addEventListener('ended', () => {
     if (sleepTimer.mode === 'eoc') {
@@ -1836,7 +1869,16 @@ function wireEvents() {
   if (saveProgressTimer) clearInterval(saveProgressTimer);
   saveProgressTimer = setInterval(() => { if (!audioEl.paused) saveProgress(); }, 10000);
 
-  document.addEventListener('visibilitychange', () => { if (document.hidden) saveProgress(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { saveProgress(); return; }
+    // Coming back to the foreground is exactly when an interruption (a call
+    // ending, dismissing Siri) typically clears -- worth an immediate retry
+    // rather than waiting out whatever backoff delay was already in flight.
+    if (pausedByInterruption && audioEl.paused) {
+      resumeAttempts = 0;
+      scheduleResumeAttempt();
+    }
+  });
   window.addEventListener('beforeunload', () => saveProgress());
 
   // ---------- search / filter / shelve ----------

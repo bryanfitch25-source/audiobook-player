@@ -5,10 +5,10 @@
 // Bumped in lockstep with sw.js's CACHE constant. Shown in the UI so there is
 // never any ambiguity, after a service-worker update, about whether the code
 // actually running is the code that was just shipped.
-const APP_VERSION = 'the-pattern-v31'; // must exactly match CACHE in sw.js
+const APP_VERSION = 'the-pattern-v32'; // must exactly match CACHE in sw.js
 
 const DB_NAME = 'audiobook-player';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 let db;
 
 function openDb() {
@@ -24,6 +24,15 @@ function openDb() {
       }
       if (!_db.objectStoreNames.contains('diagLog')) {
         _db.createObjectStore('diagLog', { keyPath: 'id', autoIncrement: true });
+      }
+      // Authors detected for PC-hosted books that have never been downloaded
+      // to this device. Those books have no local record to write an author
+      // onto -- the server's own catalog entry is the source of truth and
+      // this app can't rewrite it -- so a found author is kept here instead,
+      // keyed by the server's book id, and layered on top of the live
+      // catalog every time it's read.
+      if (!_db.objectStoreNames.contains('authorOverrides')) {
+        _db.createObjectStore('authorOverrides', { keyPath: 'id' });
       }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
@@ -377,12 +386,14 @@ function normalizeBook(book) {
  * book shape regardless of where it came from. Not persisted to IndexedDB --
  * this is rebuilt fresh from the live catalog every time, which is what lets
  * "My Computer" and "Library" be the same list with no separate add step. */
+let authorOverrides = {}; // serverId -> author, for PC books found by findMissingAuthors()
+
 function remoteToBookShape(rb) {
   const p = rb.progress || {};
   return {
     id: 'remote:' + rb.id,
     title: rb.title,
-    author: rb.author || '',
+    author: rb.author || authorOverrides[rb.id] || '',
     seriesNumber: rb.seriesNumber || null,
     chapters: (rb.chapters && rb.chapters.length)
       ? rb.chapters.map((c) => ({ name: c.name, start: c.start, duration: c.duration }))
@@ -457,6 +468,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 async function init() {
   await openDb();
+  await loadAuthorOverrides();
   await renderLibrary();
   await refreshStorageBar();
   wireEvents();
@@ -674,17 +686,67 @@ function renderAuthorList(entries) {
   }
 }
 
-// Scans every on-device book with no author set, reads whichever embedded
-// tag or filename pattern its own first chapter's audio carries, and saves
-// whatever it finds. Skips PC-only books that have never been downloaded --
-// there's no local blob to read a tag from.
+async function loadAuthorOverrides() {
+  try {
+    const rows = await idbGetAll('authorOverrides');
+    authorOverrides = {};
+    for (const r of rows) authorOverrides[r.id] = r.author;
+  } catch (e) { authorOverrides = {}; }
+}
+
+/* A File/Blob-alike backed by HTTP Range requests against the PC server's
+ * streaming endpoint, so ChapterMeta's extractors (which only ever call
+ * .size and .slice(a,b).arrayBuffer()) work the same on a PC-hosted book as
+ * on a local one, without pulling the whole file across the tunnel. The
+ * server already has to honour Range for scrub-bar seeking during playback,
+ * so this rides the same support rather than needing anything new from it. */
+async function remoteRangeHandle(url) {
+  const probe = await fetch(url, { headers: { Range: 'bytes=0-1' } });
+  let size = null;
+  const cr = probe.headers.get('Content-Range'); // "bytes 0-1/12345678"
+  const m = cr && cr.match(/\/(\d+)$/);
+  if (m) size = parseInt(m[1], 10);
+  if (size == null) {
+    const cl = probe.headers.get('Content-Length');
+    if (cl && probe.status === 200) size = parseInt(cl, 10); // Range ignored, full body sent
+  }
+  if (size == null) throw new Error('server did not report a file size');
+  return {
+    size,
+    slice(start, end) {
+      return {
+        async arrayBuffer() {
+          const res = await fetch(url, { headers: { Range: `bytes=${start}-${end - 1}` } });
+          if (!res.ok) throw new Error('range fetch failed: ' + res.status);
+          return await res.arrayBuffer();
+        },
+      };
+    },
+  };
+}
+
+// Scans every book with no author set -- on-device ones by reading their own
+// stored audio, and PC-hosted ones (downloaded or not) by range-fetching just
+// enough of the file over the tunnel to read its tags -- and saves whatever
+// it finds. A PC book's own catalog entry lives on the server and can't be
+// rewritten from here, so those go into a local override layered on top of
+// it instead; a re-scan skips anything already covered by one.
 async function findMissingAuthors() {
   const btn = $('btn-find-authors');
   const status = $('find-authors-status');
   status.classList.remove('hidden');
 
-  const books = (await idbGetAll('books')).map(normalizeBook);
-  const targets = books.filter((b) => !(b.author || '').trim() && b.chapters && b.chapters[0] && b.chapters[0].blobId);
+  const localBooks = (await idbGetAll('books')).map(normalizeBook);
+  const localTargets = localBooks
+    .filter((b) => !(b.author || '').trim() && b.chapters && b.chapters[0] && b.chapters[0].blobId)
+    .map((b) => ({ kind: 'local', book: b }));
+
+  const remoteCatalog = (window.PCLink && PCLink.isConnected()) ? PCLink.getCatalog() : [];
+  const remoteTargets = remoteCatalog
+    .filter((rb) => !(rb.author || '').trim() && !authorOverrides[rb.id])
+    .map((rb) => ({ kind: 'remote', book: rb }));
+
+  const targets = [...localTargets, ...remoteTargets];
   if (!targets.length) {
     status.textContent = 'Every book already has a teller.';
     return;
@@ -693,21 +755,33 @@ async function findMissingAuthors() {
   btn.disabled = true;
   let found = 0;
   for (let i = 0; i < targets.length; i++) {
-    const book = targets[i];
+    const { kind, book } = targets[i];
     status.textContent = `Checking ${i + 1} of ${targets.length}: ${book.title}`;
     try {
-      const { blob } = await idbGetReconstitutedBlob(book.chapters[0].blobId);
-      if (blob) {
-        let author = '';
-        try { author = await ChapterMeta.extractAuthor(blob); } catch (e) { author = ''; }
-        if (!author) author = ChapterMeta.guessAuthorFromName(book.chapters[0].name || book.title);
-        if (author) {
+      let author = '';
+      if (kind === 'local') {
+        const { blob } = await idbGetReconstitutedBlob(book.chapters[0].blobId);
+        if (blob) {
+          try { author = await ChapterMeta.extractAuthor(blob); } catch (e) { author = ''; }
+          if (!author) author = ChapterMeta.guessAuthorFromName(book.chapters[0].name || book.title);
+        }
+      } else {
+        const handle = await remoteRangeHandle(PCLink.streamUrlFor(book.id));
+        try { author = await ChapterMeta.extractAuthor(handle); } catch (e) { author = ''; }
+        if (!author) author = ChapterMeta.guessAuthorFromName(book.title);
+      }
+
+      if (author) {
+        found++;
+        if (kind === 'local') {
           book.author = author;
           await idbPut('books', book);
-          found++;
+        } else {
+          authorOverrides[book.id] = author;
+          await idbPut('authorOverrides', { id: book.id, author });
         }
       }
-    } catch (e) { /* couldn't read this one's blob -- move on */ }
+    } catch (e) { /* couldn't read this one -- move on */ }
   }
   btn.disabled = false;
   status.textContent = found

@@ -674,6 +674,49 @@ function renderAuthorList(entries) {
   }
 }
 
+// Scans every on-device book with no author set, reads whichever embedded
+// tag or filename pattern its own first chapter's audio carries, and saves
+// whatever it finds. Skips PC-only books that have never been downloaded --
+// there's no local blob to read a tag from.
+async function findMissingAuthors() {
+  const btn = $('btn-find-authors');
+  const status = $('find-authors-status');
+  status.classList.remove('hidden');
+
+  const books = (await idbGetAll('books')).map(normalizeBook);
+  const targets = books.filter((b) => !(b.author || '').trim() && b.chapters && b.chapters[0] && b.chapters[0].blobId);
+  if (!targets.length) {
+    status.textContent = 'Every book already has a teller.';
+    return;
+  }
+
+  btn.disabled = true;
+  let found = 0;
+  for (let i = 0; i < targets.length; i++) {
+    const book = targets[i];
+    status.textContent = `Checking ${i + 1} of ${targets.length}: ${book.title}`;
+    try {
+      const { blob } = await idbGetReconstitutedBlob(book.chapters[0].blobId);
+      if (blob) {
+        let author = '';
+        try { author = await ChapterMeta.extractAuthor(blob); } catch (e) { author = ''; }
+        if (!author) author = ChapterMeta.guessAuthorFromName(book.chapters[0].name || book.title);
+        if (author) {
+          book.author = author;
+          await idbPut('books', book);
+          found++;
+        }
+      }
+    } catch (e) { /* couldn't read this one's blob -- move on */ }
+  }
+  btn.disabled = false;
+  status.textContent = found
+    ? `Found a teller for ${found} of ${targets.length} book${targets.length === 1 ? '' : 's'}.`
+    : `No embedded tellers found among ${targets.length} book${targets.length === 1 ? '' : 's'}. Their files carry no author tag.`;
+
+  if (found) await renderLibrary();
+}
+
 // The per-teller page: numeric series order within each half, unfinished
 // books first (what's actually left to read), a divider, then what's done.
 function openAuthorView(author) {
@@ -1066,6 +1109,15 @@ async function handleFilesPicked(e) {
       fileStatus[i] = res.playable
         ? { state: 'native', duration: res.duration, marks }
         : { state: 'convert', duration: 0, marks };
+
+      // Only the first file is worth checking -- if it has no author tag the
+      // rest of the same book's files almost certainly don't either.
+      if (i === 0 && !bookAuthorInput.value.trim()) {
+        let guessed = '';
+        try { guessed = await ChapterMeta.extractAuthor(f); } catch (e) { guessed = ''; }
+        if (!guessed) guessed = ChapterMeta.guessAuthorFromName(f.name);
+        if (guessed) bookAuthorInput.value = guessed;
+      }
     }
     renderPickedFiles();
   }
@@ -2006,6 +2058,7 @@ function wireEvents() {
   // ---------- settings sheet ----------
   $('btn-settings').addEventListener('click', () => $('modal-settings').classList.remove('hidden'));
   $('btn-close-settings').addEventListener('click', () => $('modal-settings').classList.add('hidden'));
+  $('btn-find-authors').addEventListener('click', () => findMissingAuthors());
   const bufferSelect = $('buffer-window-select');
   bufferSelect.value = String(STREAM_BUFFER_AHEAD_SECONDS / 60);
   bufferSelect.addEventListener('change', (e) => setBufferMinutes(Number(e.target.value)));

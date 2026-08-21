@@ -333,6 +333,102 @@ const ChapterMeta = (() => {
     return out;
   }
 
+  // ---------- author tag reading ----------
+  //
+  // Audiobook taggers put the author somewhere in the same embedded metadata
+  // that carries title/album. There's no dedicated "author" field in either
+  // format, so this reads the fields convention actually uses: ID3v2 TPE1
+  // ("artist"), falling back to TPE2, and MP4 the (c)ART / aART atoms, in
+  // whichever order the file actually has them filled in.
+
+  async function parseId3Author(file) {
+    const head = await readRange(file, 0, 10);
+    if (head.byteLength < 10) return '';
+    if (String.fromCharCode(head.getUint8(0), head.getUint8(1), head.getUint8(2)) !== 'ID3') return '';
+    const major = head.getUint8(3);
+    const tagSize = syncsafe(head, 6);
+    if (tagSize <= 0 || tagSize > 40 * 1024 * 1024) return '';
+
+    const dv = await readRange(file, 10, tagSize);
+    let tpe1 = '', tpe2 = '';
+    parseId3Frames(dv, 0, dv.byteLength, major, (id, s, e) => {
+      if (id !== 'TPE1' && id !== 'TPE2') return;
+      const text = readId3Text(new Uint8Array(dv.buffer, dv.byteOffset + s, e - s));
+      if (id === 'TPE1' && !tpe1) tpe1 = text;
+      if (id === 'TPE2' && !tpe2) tpe2 = text;
+    });
+    return (tpe1 || tpe2 || '').trim();
+  }
+
+  function findIlst(dv, meta) {
+    // Standard ISO "meta" is a full box (4 bytes of version+flags before its
+    // children); some QuickTime-style files write it as a plain box. Try both.
+    return findBox(dv, meta.body + 4, meta.bodyEnd, 'ilst') || findBox(dv, meta.body, meta.bodyEnd, 'ilst');
+  }
+
+  function mp4TagText(dv, ilst, names) {
+    const children = boxes(dv, ilst.body, ilst.bodyEnd);
+    for (const name of names) {
+      const atom = children.find((c) => c.type === name);
+      if (!atom) continue;
+      const dataBox = findBox(dv, atom.body, atom.bodyEnd, 'data');
+      if (!dataBox) continue;
+      const payloadStart = dataBox.body + 8; // 4-byte type indicator + 4-byte locale
+      if (payloadStart >= dataBox.bodyEnd) continue;
+      const bytes = new Uint8Array(dv.buffer, dv.byteOffset + payloadStart, dataBox.bodyEnd - payloadStart);
+      const text = decodeText(bytes).trim();
+      if (text) return text;
+    }
+    return '';
+  }
+
+  async function parseMp4Author(file) {
+    const moov = await findTopLevel(file, 'moov');
+    if (!moov || moov.size > 128 * 1024 * 1024) return '';
+    const dv = await readRange(file, moov.offset, moov.size);
+    const body = moov.header;
+    const end = dv.byteLength;
+
+    let meta = findBox(dv, body, end, 'meta');
+    if (!meta) {
+      const udta = findBox(dv, body, end, 'udta');
+      if (udta) meta = findBox(dv, udta.body, udta.bodyEnd, 'meta');
+    }
+    if (!meta) return '';
+
+    const ilst = findIlst(dv, meta);
+    if (!ilst) return '';
+    return mp4TagText(dv, ilst, ['\xA9ART', 'aART', '\xA9wrt']);
+  }
+
+  /** Reads whatever the file's own tags say the author is, or '' if nothing is set. */
+  async function extractAuthor(file) {
+    try {
+      const id3 = await parseId3Author(file);
+      if (id3) return id3;
+    } catch (e) { /* fall through */ }
+
+    try {
+      const mp4 = await parseMp4Author(file);
+      if (mp4) return mp4;
+    } catch (e) { /* fall through */ }
+
+    return '';
+  }
+
+  // Last-resort guess when a file carries no author tag at all: audiobook
+  // filenames are very often "Author Name - Book Title". Only trusts patterns
+  // that actually look like a person's name, so it stays quiet rather than
+  // filling in nonsense from an ordinary title.
+  function guessAuthorFromName(name) {
+    const base = (name || '').replace(/\.[^.]+$/, '');
+    const m = base.match(/^\s*([^-–—_]{3,60}?)\s*[-–—_]{1,3}\s*(.{3,})$/);
+    if (!m) return '';
+    const author = m[1].trim();
+    if (/^[A-Za-z][A-Za-z.'-]*(\s+[A-Za-z][A-Za-z.'-]*){0,3}$/.test(author)) return author;
+    return '';
+  }
+
   // ---------- public ----------
 
   /** Returns [{ name, start }] sorted by start, or [] if the file has no chapters. */
@@ -379,5 +475,5 @@ const ChapterMeta = (() => {
     return out;
   }
 
-  return { extract };
+  return { extract, extractAuthor, guessAuthorFromName };
 })();

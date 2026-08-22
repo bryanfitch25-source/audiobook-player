@@ -5,7 +5,7 @@
 // Bumped in lockstep with sw.js's CACHE constant. Shown in the UI so there is
 // never any ambiguity, after a service-worker update, about whether the code
 // actually running is the code that was just shipped.
-const APP_VERSION = 'the-pattern-v32'; // must exactly match CACHE in sw.js
+const APP_VERSION = 'the-pattern-v33'; // must exactly match CACHE in sw.js
 
 const DB_NAME = 'audiobook-player';
 const DB_VERSION = 3;
@@ -1699,8 +1699,17 @@ function persistBookState() {
   if (!currentBook) return;
   if (currentBook.streamUrl && !currentBook.offline) {
     if (window.PCLink) PCLink.pushProgress(currentBook.sourceServerId, currentBook.currentTime, currentBook.currentChapterIndex);
-  } else {
-    idbPut('books', currentBook);
+    return;
+  }
+  idbPut('books', currentBook).catch((e) => checkpoint('persistBookState: idbPut failed: ' + (e && e.message ? e.message : String(e))));
+  // A book kept offline still came from the PC and still has a server-side
+  // record of its progress -- if that stopped getting updated the moment it
+  // went offline, deleting the offline copy later would fall back to
+  // whatever position the server was frozen at from before, not wherever
+  // offline listening actually left off. Keeping both in sync means either
+  // one is safe to read from.
+  if (currentBook.offline && currentBook.sourceServerId && window.PCLink && PCLink.isConnected()) {
+    PCLink.pushProgress(currentBook.sourceServerId, currentBook.currentTime, currentBook.currentChapterIndex);
   }
 }
 
@@ -2113,6 +2122,10 @@ function wireEvents() {
     }
   });
   window.addEventListener('beforeunload', () => saveProgress());
+  // beforeunload is unreliable on iOS Safari (including installed home-screen
+  // PWAs) -- pagehide is the event actually documented to fire there when the
+  // OS reclaims the page, so it's the one worth trusting for a last save.
+  window.addEventListener('pagehide', () => saveProgress());
 
   // ---------- search / filter ----------
   $('btn-search-toggle').addEventListener('click', () => $('search-bar').classList.toggle('hidden'));
